@@ -1,0 +1,1228 @@
+---
+title: "1_PrepareData"
+author: "Aimara Planillo"
+date: "11/8/2021"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+# Nightingale observation data
+
+CS_SDM_NightingaleBerlin
+
+### Packages
+```{r}
+source("./CS_SDM_NightingaleBerlin/source_packages.R")
+```
+
+
+
+### Workspace
+```{r}
+work_dir <- getwd()
+
+rawdata_wd <- file.path(work_dir, "/4_Raw_data/")
+procdata_wd <- file.path(work_dir, "/6_Processed_data/")
+results_wd <- file.path(work_dir, "/7_results")
+```
+
+
+## Clean and filter Nigthtingale data for analyses
+
+### Forschungsfall Nachtingall project 
+Opportunistic citizen science data in Berlin
+
+```{r load CS data}
+# Load nightingale data
+nightingales2018 <- read.csv(paste0(rawdata_wd, "/Berlin_Nachtigall_project2018_2019/191028_nightingale_2018_full.csv")) 
+summary(nightingales2018)
+head(nightingales2018, 10)
+
+# date and time of the observations 
+options("scipen"=10, "digits"=4)
+nightingales2018$dateTime[2:5]
+
+## Filter data by location
+# Load berlin polygon 
+berlin <- read_sf(paste0(rawdata_wd, "/EnvCov/berlin_city_border_25833.gpkg")) %>% 
+  st_transform(25833)
+
+#Transform nightingale data into spatial object
+nightingales2018_points <- nightingales2018 %>%
+  filter(isNightingale == "y") %>% # Filter = Correctly identifyed
+  dplyr::select(userId, geo_lng, geo_lat, isNightingale, geo_address_state) %>%
+  st_as_sf(coords = c("geo_lng", "geo_lat"), crs = 4326) %>%
+  st_transform(25833)
+
+# filter by Berlin polygon
+nightingales2018_berlin <- st_join(nightingales2018_points, berlin, join  = st_intersects) %>% 
+  filter(!is.na(spatial_al))
+
+# Check points
+tmap_mode("plot")
+map_filpolygon2018 <- tm_shape(berlin)+
+  tm_borders("black", lwd = 2)+
+  tm_shape(nightingales2018_points) +
+  tm_symbols(shape = 16, size = 0.5, col = "blue")+
+  tm_shape(nightingales2018_berlin)+
+  tm_symbols(shape = 16, size = 0.2, col = "lightblue")+
+  tm_add_legend(type = "symbol", labels = c("All records", "Intersecting Berlin records"),
+                col = c("blue", "lightblue"), size = c(0.5, 0.5), shape = 16) 
+
+map_filpolygon2018
+
+# save image of the map 
+tmap_save(map_filpolygon2018, filename = paste0(results_wd,                                                 "/interim_results/Map_allrecords2018_nachtigall_filteredBerlin.png"), 
+          dpi = 600)
+```
+
+```{r prepare maxent data from CS}
+# Extract MaxEnt data
+nightingales2018_berlin_25833 <- as.data.frame(st_coordinates(nightingales2018_berlin))
+nightingales_berlin_maxent2018 <- cbind.data.frame(species = rep("Nightingale2018"), nightingales2018_berlin_25833)
+head(nightingales_berlin_maxent2018)
+
+# save for later use
+write.csv(nightingales_berlin_maxent2018, 
+          paste0(procdata_wd, "/Nachtigall_project/Nightingales_corrected_2018_maxent.csv"), row.names = FALSE)
+```
+
+
+## Breeding bird monitoring data 
+Abundance data based on stablished standardized transects, collected in 2017
+
+```{r load monitoring data}
+# Nightingale Data
+breeding_birds <- read.csv(paste0(rawdata_wd, "/BreedingBirdMonitoringData_2017/Birds_sitexsp_fullnames.csv"))
+breeding_transects <- read.csv(paste0(rawdata_wd, "/BreedingBirdMonitoringData_2017/Transects_variables_buffer100.csv"))
+str(breeding_birds)
+str(breeding_transects)
+
+colnames(breeding_birds)
+colnames(breeding_transects)
+
+breeding_birds <- breeding_birds %>%
+  mutate(SITE = toupper(SITE))
+
+# get number of nightingales per transect and transect length
+breeding_nightingales <- breeding_transects %>%
+  mutate(SITE = as.factor(toupper(transect))) %>%
+  dplyr::select(SITE, length) %>%
+  left_join(breeding_birds, breeding_nightingales, by = "SITE") %>%
+  mutate(Lm_km = Luscinia_megarhynchos/length * 1000) %>%
+  dplyr::select(SITE, length, Luscinia_megarhynchos, Lm_km)
+
+breeding_nightingales
+
+# save for later use
+write.csv(breeding_nightingales, 
+          paste0(procdata_wd, "/Breeding_birds/Nightingale_abundance_transects.csv"), 
+          row.names = FALSE)
+```
+
+
+## eBird data
+Data obtained from observations submitted to ebird in years 2017 and 2018
+```{r load ebird data}
+# directory
+ebird_wd <- paste0(rawdata_wd, "/eBird_Nightingales_2017_2018")
+
+# functions to work with ebird data
+walk(list.files("./CS_SDM_NightingaleBerlin/R_functions_Johnston", full.names = TRUE), source)
+
+# location of large unzipped eBird data should be set in advance with auk_set_ebd_path()
+auk::auk_set_ebd_path(ebird_wd, overwrite = TRUE)
+
+# name of the EBD release
+ebd_release <- "Jul-2020"
+# where to save the processed datasets
+data_save <- file.path(procdata_wd, "/eBird/")
+# name for this specific data extraction
+data_tag <- "marjul_201718_nightingale"
+
+# ebd extraction
+orig_ebd <- paste0(ebird_wd, "/ebd_DE_201701_201912_rel", ebd_release, "/ebd_DE_201701_201912_rel", ebd_release, ".txt")
+orig_sampling <- paste0(ebird_wd, "/ebd_sampling_rel", ebd_release, "/ebd_sampling_rel", ebd_release, ".txt")
+```
+
+```{r prepare ebird maxent format}
+# extract all nightingale observations for maxent
+# no sampling info
+f_ebd_all <- paste0(procdata_wd, "/eBird/ebd_", data_tag, "_all.txt")
+
+# process the ebird data keeping only certain species, regions, and dates
+ebd_filtered <- auk_ebd(orig_ebd) %>% 
+    # select species: nightingales
+    auk_species(c("Common nightingale")) %>% 
+    # select region: Berlin (state code DE-BE)
+    auk_state(state = "DE-BE") %>% 
+    # select dates: from march to july, any year
+    auk_date(date = c("*-03-01", "*-07-31")) %>% 
+    auk_filter(file = f_ebd_all, overwrite = TRUE) %>%
+    read_ebd()
+
+# clean up variables
+ebd_nightingales_berlin <- ebd_filtered %>% 
+  mutate(
+    # use species code
+    species_code = ebird_species(scientific_name, "code"),
+    # convert X to NA
+    observation_count = if_else(observation_count == "X", 
+                                NA_character_, observation_count),
+    observation_count = as.integer(as.character(observation_count)),
+    # effort_distance_km to 0 for non-travelling counts. ##No need for maxent
+    effort_distance_km = if_else(protocol_type != "Traveling", 
+                                 0, effort_distance_km),
+    # convert time to decimal hours since midnight. ##No need for maxent
+    time_observations_started = time_to_decimal(time_observations_started)) %>%
+    # additional effort filters intentionally not applied
+    # additional filtering - years 2017 and 2018
+    filter(year(observation_date) > 2016,
+           year(observation_date) < 2019)
+
+ebd_nightingales_berlin$effort_distance_km
+table(ebd_nightingales_berlin$observation_date)
+
+
+# output
+ebd_nightingales_berlin <- ebd_nightingales_berlin %>% 
+  select(checklist_id, observer_id, sampling_event_identifier,
+         species_code,
+         observation_count,  
+         state_code, locality_id, latitude, longitude,
+         protocol_type, all_species_reported,
+         observation_date, time_observations_started, 
+         duration_minutes, effort_distance_km,
+         number_observers)
+
+# save for later use
+write_csv(ebd_nightingales_berlin, paste0(procdata_wd, "/eBird/ebd_", data_tag, "_all_presences.csv"), na = "")
+```
+
+```{r get presence-absence data ebird with sampling effort }
+# good processing practices
+
+# process the ebird data with sampling effort data, 
+# keeping only certain species, regions, and dates
+
+f_ebd_completelists <- paste0(procdata_wd, "/eBird/ebd_", data_tag, "_complete_lists.txt")
+f_sampling_completelists <- paste0(procdata_wd, "/eBird/ebd_sampling_", data_tag, "_complete_lists.txt")
+
+ebd_filtered_effort <- auk_ebd(orig_ebd, 
+                          file_sampling = orig_sampling) %>%
+  # select species: nightingales
+  auk_species(c("Common nightingale")) %>% 
+  # select region: Berlin (state code DE-BE)
+  auk_state(state = "DE-BE") %>% 
+  # select dates: from march to july, any year
+  auk_date(date = c("*-03-01", "*-07-31")) %>% 
+  # complete checklists
+  auk_complete() %>%
+  auk_filter(file = f_ebd_completelists, file_sampling = f_sampling_completelists)
+
+
+# zero fill
+# zero-filling complete checklists
+ebd_zf_complete <- auk_zerofill(f_ebd_completelists, f_sampling_completelists, 
+                           collapse = TRUE, complete = TRUE)
+
+# clean up variables
+ebd_zf_nightingales <- ebd_zf_complete %>% 
+  mutate(
+    # use species code
+    species_code = ebird_species(scientific_name, "code"),
+    # convert X to NA
+    observation_count = if_else(observation_count == "X", 
+                                NA_character_, observation_count),
+    observation_count = as.integer(as.character(observation_count)),
+    # effort_distance_km to 0 for non-travelling counts
+    effort_distance_km = if_else(protocol_type != "Traveling", 
+                                 0, effort_distance_km),
+    # convert time to decimal hours since midnight
+    time_observations_started = time_to_decimal(time_observations_started))
+
+table(ebd_zf_nightingales$scientific_name, ebd_zf_nightingales$all_species_reported)
+table(ebd_zf_nightingales$scientific_name, year(ebd_zf_nightingales$observation_date))
+
+# additional filtering - years 2017 and 2018
+# additional effort filters intentionally not applied
+ebd_zf_nightingales <- filter(ebd_zf_nightingales, 
+                     year(observation_date) > 2016,
+                     year(observation_date) < 2019)
+
+table(year(ebd_zf_nightingales$observation_date))
+
+# additional filtering
+ebd_zf_nightingales <- ebd_zf_nightingales %>% 
+  filter(
+    # complete checklists
+    all_species_reported == TRUE,
+    # only keep stationary or traveling protocols
+    protocol_type %in% c("Stationary", "Traveling"),
+    # effort filters
+    duration_minutes <= 5 * 60,
+    effort_distance_km <= 5,
+    !is.na(time_observations_started),
+    number_observers <= 10)
+
+# output
+ebd_zf_nightingales_final <- ebd_zf_nightingales %>% 
+  dplyr::select(checklist_id, observer_id, sampling_event_identifier,
+         species_code,
+         observation_count, species_observed, 
+         state_code, locality_id, latitude, longitude,
+         protocol_type, all_species_reported,
+         observation_date, time_observations_started, 
+         duration_minutes, effort_distance_km,
+         number_observers)\
+
+# save for later use
+write_csv(ebd_zf_nightingales_final, paste0(procdata_wd, "/eBird/ebd_", data_tag, "_zf.csv"), na = "")
+```
+
+```{r summarise ebirds numbers}
+nrow(ebd_zf_complete)
+# [1] 2430
+
+nrow(ebd_zf_nightingales)
+# [1] 619 # complete lists in Berlin in 2017 and 2018
+
+nrow(ebd_zf_nightingales_final)
+# [1] 619
+
+table(year(ebd_zf_nightingales_final$observation_date), ebd_zf_nightingales_final$observation_count)
+  #        0   1   2   3   4   5   7   9
+  # 2017 153   6   5   1   1   0   0   0
+  # 2018 423  20   3   2   1   2   1   1
+
+# split by year 
+ebd_zf_nightingales_final %>%
+  mutate(checklist_id = as.character(checklist_id)) %>%
+  mutate(yr = year(observation_date)) %>%
+  select(yr) %>%
+  table()
+# 2017 2018 
+# 166  453 
+
+# 2017 
+ebd_zf_nightingales_final %>%
+  mutate(checklist_id = as.character(checklist_id)) %>%
+  mutate(yr = year(observation_date)) %>%
+  filter(yr == 2017) %>%
+  nrow()
+# [1] 166
+
+# 2017 complete, effort filtered
+ebd_zf_nightingales_final %>%
+  filter(all_species_reported) %>%
+  filter(protocol_type %in% c("Stationary", "Traveling")) %>%
+  mutate(duration_minutes = as.numeric(as.character(duration_minutes))) %>%
+  filter(effort_distance_km <= 5,
+         duration_minutes <= 5 * 60,
+         number_observers <= 10) %>%
+  nrow()
+# [1] 411
+
+table(ebd_zf_nightingales_final$species_observed, year(ebd_zf_nightingales_final$observation_date))
+table(ebd_zf_nightingales_final$species_observed, ebd_zf_nightingales_final$protocol_type)
+```
+
+```{r spatial subsample of ebird data}
+# Create raster with 1 km resolution to filter lists 
+## here we use the tree cover raster as a base raster
+r_tree <- raster(paste0(rawdata_wd, "/EnvCov/tree_cover_20m_25833.tif")) %>%
+  mask(berlin)
+r_tree <- projectRaster(r_tree, crs = CRS('+init=EPSG:3035'))
+plot(r_tree)
+plot(st_geometry(ebird_data_proj), add = T)
+
+r_agg <- aggregate(x = r_tree, fact = 50, fun = sum) # the raster was 20m res, change to 1km
+plot(r_agg)
+
+# extract the cell numbers that correspond with the cells with observations
+# based on coordinates
+
+p <- as(r_agg, 'SpatialPixels')
+p1 <- as.data.frame(p)
+
+# get cells form projected nightingales observations
+cells <- cellFromXY(r_agg, st_coordinates(ebird_data_proj)[, c("X", "Y")]) 
+
+# filter data by cells
+
+## TEMPORAL AND SPATIAL SUBSAMPLE: BY year and cell numbers 
+# When a presence is detected in a cell, we keep it!
+nightingales_sspattemp_tmp <- ebd_zf_nightingales_final %>%
+  filter(all_species_reported) %>%
+  mutate(year = lubridate::year(observation_date)) 
+table(nightingales_sspattemp_tmp$species_observed,year(nightingales_sspattemp_tmp$observation_date) )
+
+nightingales_sspattemp_tmp$byvar <- as.character(as.vector(as.matrix(nightingales_sspattemp_tmp[,"year"])))
+
+x_cell <- nightingales_sspattemp_tmp %>% 
+      mutate(cell = cells,
+             obs = as.logical(species_observed))
+
+table(x_cell$cell, x_cell$obs)
+as.data.frame(x_cell[x_cell$cell == 370,])
+colSums(table(x_cell$cell, x_cell$obs))
+allobs_cell <- rowSums(table(x_cell$cell, x_cell$obs))
+
+# select one observation per cell per year
+x_cell_ret <- x_cell %>%
+  dplyr::group_by(byvar, cell) %>% 
+  mutate(weight = ifelse(species_observed == TRUE, 1, 0.001)) %>%
+  dplyr::sample_n(size = 1, weight = weight) %>% 
+  dplyr::ungroup() %>%
+  dplyr::select(-byvar)
+  
+table(x_cell_ret$cell, x_cell_ret$obs)
+colSums(table(x_cell_ret$cell, x_cell_ret$obs))
+oneobs_cell <- rowSums(table(x_cell_ret$cell, x_cell_ret$obs))
+
+
+nightingales_sspattemp_final <- x_cell_ret %>%
+  dplyr::select(checklist_id, sampling_event_identifier, cell) %>%
+  mutate(selected = 1) %>%
+  left_join(ebd_zf_nightingales_final)
+
+finalobs_cell <- rowSums(table(nightingales_sspattemp_final$cell, nightingales_sspattemp_final$species_observed))
+
+cbind.data.frame(allobs_cell, oneobs_cell, finalobs_cell)
+
+
+nightingales_sspattemp_proj <- st_as_sf(nightingales_sspattemp_final, coords = c("longitude", "latitude"), crs = 4326) %>%
+  st_transform(crs = 3035)
+
+nrow(nightingales_sspattemp_final)
+# 169
+
+table(nightingales_sspattemp_final$species_observed)
+# FALSE  TRUE 
+#   139    30 
+table(nightingales_sspattemp_final$species_observed, nightingales_sspattemp_final$protocol_type)
+
+# save for alter use
+write.csv(nightingales_sspattemp_final, paste0(procdata_wd, "/eBird/ebd_marjul201718_nightingale_zf_ss1km.csv"), 
+          row.names = FALSE)
+```
+
+
+
+# Prepare background and bias files
+
+## Sampling effort bias raster
+number of observations as sampling effort, 
+value of 0,01 for background cells, 
+and value of NA for cells outside background area.
+
+### Records
+```{r load data}
+# CS Nachtigall data
+nightingales_2018 <- read.csv(paste0(procdata_wd, "/Nightingales_corrected_2018_maxent.csv"))
+nightingales_2018map <- st_as_sf (nightingales_2018, coords = c("X", "Y"), crs = 25833)
+plot(st_geometry(nightingales_2018map))
+
+# Spatial data
+berlin <- read_sf(paste0(rawdata_wd, "/Maps/berlin_city_border_25833.gpkg"), crs = 25833)
+tree <- raster(paste0(procdata_wd, "/ForPrediction/tree_100m.asc"), crs = CRS('+init=EPSG:25833')) # as reference raster to build the new layers
+plot(tree)
+plot(st_geometry(berlin), add = TRUE)
+
+# create buffer around observations
+buffer1000 <- st_buffer(nightingales_2018map, dist = 1000)
+buffer1000
+ 
+buffer1000 <- st_union(buffer1000) %>%
+
+plot(st_geometry(berlin))
+plot(st_geometry(buffer1000), col = "red", add = TRUE)
+
+# save for later use
+st_write(buffer1000, paste0(procdata_wd, "/Background1000m/background_polygon_1000m_25833.gpkg"), 
+         delete_layer = TRUE)
+```
+
+```{r transform buffer into raster}
+ref.ras <- raster(tree)
+
+buffer1000 <- st_sf(buffer1000) # combine outputs sfc; need sf for fasterize.
+class(buffer1000)
+
+buffer1000.r1 <- buffer1000 %>% fasterize(raster = ref.ras, fun = "min") # all cells have value 1
+plot(buffer1000.r1)
+intersect(buffer1000.r1, nightingales_2018map)
+buffer1000.r2 <- mask(buffer1000.r1, berlin)
+
+plot(buffer1000.r2)
+```
+
+```{r assign sampling effort bias values}
+# we use the background raster as reference
+sampling_effort <- rasterize(nightingales_2018map, buffer1000.r2, fun='count',
+                              file = "species", background = 0.1, 
+                             overwrite =TRUE) 
+sampling_effort <- mask(sampling_effort, buffer1000.r2)
+sampling_effort <- sampling_effort$species
+names(sampling_effort) <- "sampling_effort"
+
+plot(buffer1000.r2)
+plot(sampling_effort)
+
+# visualize
+tmap_mode("view")
+tm_shape(tree) +
+  tm_raster("tree_100m", 
+            palette = "Greens") +
+  tm_shape(berlin)+
+  tm_borders("grey") +
+  tm_shape(sampling_effort)+
+  tm_raster("sampling_effort",
+            breaks = c(-Inf, 0.5, 5, 10, 25))+
+  tm_shape(nightingales_2018map)+
+  tm_dots("blue")
+
+# Check if everything fits with tmap
+tmap_mode("view")
+tm_shape(tree) +
+  tm_raster("tree_100m", 
+            palette = "Greens") +
+  tm_shape(berlin)+
+  tm_borders("grey") +
+  tm_shape(buffer1000)+
+  tm_borders("red")+
+  tm_shape(buffer1000.r2)+
+  tm_raster("layer")+
+  tm_shape(nightingales_2018map)+
+  tm_dots("blue")
+
+# save for later use
+writeRaster(buffer1000.r2, 
+            paste0(procdata_wd, "/Background1000m/Background_raster_1000m_25833.asc"), 
+            format = "ascii", overwrite = TRUE)
+writeRaster(sampling_effort$sampling_effort, 
+            paste0(procdata_wd, "/Background1000m/Bias_sampling_effort_1000m_25833.asc"), 
+            format = "ascii", overwrite = TRUE)
+```
+
+
+# Crop all environmental to background area
+To use a restrictred background area in Maxent, we first need to 
+crop the environmental variables to that area
+
+```{r crop env varibles}
+# load env variables
+env_cov <- stack(paste0(procdata_wd, "/ForPrediction/env_cov_berlin_100m_25833.tif")) # stack of rasters
+namefile <- read.csv(paste0(procdata_wd, "/ForPrediction/names_env_cov_berlin_100m_25833.csv")) # file with the names in order
+names(env_cov) <- namefile$x
+
+plot(env_cov$preyabu_100m)
+plot(buffer1000.r2, add=TRUE, col = "blue")
+plot(st_geometry(buffer1000), add = TRUE, border = "red")
+
+# crop to background area
+env_cov_bg <- mask(env_cov, buffer1000.r2) 
+
+# Save for later use
+writeRaster(env_cov_bg, paste0(procdata_wd, "/Background1000m/env_cov_berlin1000m_100m_25833.tif"), overwrite = TRUE) 
+write.csv(names(env_cov_bg), paste0(procdata_wd, "/Background1000m/names_env_cov_berlin1000m_100m_25833.csv"), 
+          row.names = FALSE)
+
+# Save each layer in ascii format
+writeRaster(env_cov_bg, filename=paste0(procdata_wd, "/Background1000m/", names(env_cov_bg)), bylayer=TRUE, format = "ascii")
+```
+
+
+# Extract env covariates values
+
+We are going to extract the environmental variables values that correspond 
+to the observations in each dataset and create histograms 
+Three datasets: 
+- JSDM data (standardized data)
+- eBird (semi-structured data)
+- Forschungsfall Nachtigall Project (opportunistic unstructured data)
+
+Spatial projection of data is *epgs 25833* unless otherwise specified. 
+
+
+## Environemntal data
+
+The original environmental layers have a resolution of 20 meters. We decided to use a 
+resolution of 100 m for this study. 
+Thus, we resample the environemtal layers to 100 m by aggregating them and using the mean, 
+except for human population that is summed to represent population/ha. 
+
+Environmental covariates:
+~ tree cover + open green area + noise + human population + prey abundance
+
+```{r urbanization layer - env covariates}
+# context polygons
+berlin <- read_sf(paste0(rawdata_wd, "/Maps/berlin_city_border_25833.gpkg"))
+water <- read_sf(paste0(rawdata_wd, "/Maps/waterbodies_Berlin_25833.gpkg"))
+
+# load data
+list.files(paste0(rawdata_wd, "/Maps/"))
+
+distwtr <- raster(paste0(rawdata_wd, "/Maps/dist_water_20m_25833.tif"))
+tree <- raster(paste0(rawdata_wd, "/Maps/tree_cover_20m_25833.tif"))
+ogreen <- raster(paste0(rawdata_wd, "/Maps/open_green_area_20m_25833.tif"))
+tempday <- raster(paste0(rawdata_wd, "/Maps/temp_day_20m_25833.tif"))
+tempnight <- raster(paste0(rawdata_wd, "/Maps/temp_night_20m_25833.tif"))
+
+imperv <- raster(paste0(rawdata_wd, "/Maps/impervious_surface_20m_25833.tif"))
+noise <- raster(paste0(rawdata_wd, "/Maps/noise_dn_20m_25833.tif"))
+hpop <- raster(paste0(rawdata_wd, "/Maps/population_density_20m_25833.tif"))
+light <- raster(paste0(rawdata_wd, "/Maps/light_nasa_20m_25833.tif"))
+
+urbanization_var <- list(distwtr, tree, ogreen, tempday, tempnight, 
+                         imperv, noise, light)
+
+# Resample to 100 x 100 resolution
+# Variables to aggregate
+urbanization_100m <- list()
+for (i in 1:length(urbanization_var)){
+  urbanization_100m[[i]] <- aggregate(urbanization_var[[i]], fact = 5, fun = mean)
+}
+
+# variables to sum
+hpop_100m <- aggregate(hpop, fact = 5, fun = sum)
+
+# all variables
+urbanization_cov <- stack(c(urbanization_100m, hpop_100m))
+plot(urbanization_cov)
+
+# mask with berlin layer
+plot(urbanization_cov$tree_cover_20m_25833)
+plot(st_geometry(berlin), add = TRUE)
+urbanization_cov <- mask(urbanization_cov, berlin)
+plot(urbanization_cov)
+
+# Load prey data and transform it into raster
+carabids_table <- read.csv(paste0(rawdata_wd, "/Maps/Predict_Berlin_100m_carabids2_3sites.csv")) 
+grasshoppers_table <- read.csv(paste0(rawdata_wd, "/Maps/Predict_Berlin_100m_grasshop2_3sites.csv"))
+spiders_table <- read.csv(paste0(rawdata_wd, "/Maps/Predict_Berlin_100m_spiders2_3sites.csv"))
+
+head(carabids_table)
+str(carabids_table)
+
+
+# Create a general raster to paste the values:
+# We use tree rater as a template
+raster1 <- raster(tree)
+
+# Transform it to 100m resolution (as the original grid used for prediction)
+raster.100m <- aggregate(raster1, fact = 5)
+
+# Give NA values to the cells and create to empty rasters to plot the predictions
+raster.100m[cells] <- NA
+
+# create the rasters for the invertebrates
+raster.carabids <- raster.100m
+# extract the cell numbers that correspond with the cells with predicitons 
+# based on coordinates
+cells <- cellFromXY(raster.100m, as.matrix(carabids_table[, c("x", "y")]))
+# Assign values to raster cells
+raster.carabids[cells] <- carabids_table$carabids.pred.abu
+plot(raster.carabids)
+
+raster.grasshop <- raster.100m
+cells <- cellFromXY(raster.100m, as.matrix(grasshoppers_table[, c("x", "y")]))
+raster.grasshop[cells] <- grasshoppers_table$grasshop.pred.abu
+plot(raster.grasshop)
+
+raster.spiders <- raster.100m
+cells <- cellFromXY(raster.spiders, as.matrix(spiders_table[, c("x", "y")]))
+raster.spiders[cells] <- spiders_table$spiders.pred.abu
+plot(raster.spiders)
+
+# Create raster prey abundance
+prey_abund <- sum(raster.carabids$layer + raster.grasshop$layer + raster.spiders$layer)
+
+# Stack togheter all the covariates
+
+env_cov <- stack(urbanization_cov, prey_abund)
+names(env_cov) <- c("distwtr_100m", "tree_100m", "ogreen_100m", "tempday_100m", "tempnight_100m",
+                    "imperv_100m",  "noise_100m", "light_100m", "hpop_100m", "preyabu_100m")
+
+plot(env_cov)
+
+# Save environmental covariates as ascii files
+writeRaster(env_cov, paste0(procdata_wd, "/ForPrediction/env_cov_berlin_100m_25833.tif"), overwrite = TRUE) 
+write.csv(names(env_cov), paste0(procdata_wd, "/ForPrediction/names_env_cov_berlin_100m_25833.csv"), row.names = FALSE)
+
+# each layer in ascii format
+writeRaster(env_cov$tree_100m, paste0(procdata_wd, "/ForPrediction/treecover_100m_25833.asc"), format = "ascii", overwrite = TRUE)
+writeRaster(env_cov$ogreen_100m, paste0(procdata_wd, "/ForPrediction/opengreen_100m_25833.asc"), format = "ascii", overwrite = TRUE)
+writeRaster(env_cov$noise_100m, paste0(procdata_wd, "/ForPrediction/noise_100m_25833.asc"), format = "ascii", overwrite = TRUE)
+writeRaster(env_cov$hpop_100m, paste0(procdata_wd, "/ForPrediction/humanpopulatio_100m_25833.asc"), 
+            format = "ascii", overwrite = TRUE)
+writeRaster(env_cov$preyabu_100m, paste0(procdata_wd, "/ForPrediction/preyabu_100m_25833.asc"), format = "ascii", overwrite = TRUE)
+```
+
+```{r example map observations vs hpop covariate}
+# real data
+nightingales_2018 <- read.csv(paste0(procdata_wd, "/Nightingales_corrected_2018_maxent.csv"))
+nightingales_2018map <- st_as_sf (nightingales_2018, coords = c("X", "Y"), crs = 25833)
+plot(st_geometry(nightingales_2018map))
+
+tm_shape(env_cov) +
+  tm_raster( "hpop_100m", title = "Human population",
+             palette = "OrRd",
+             alpha = 1)+
+  tm_shape(berlin) +
+  tm_borders("ivory4", lwd = 2.5) +
+  # tm_text("spatial_al") 
+  tm_shape(water) +
+  tm_polygons("lightblue", border.col = NULL) +
+  tm_shape(nightingales_2018map) +
+  tm_symbols(col = "blue", alpha = 0.5,
+             size = 0.2,
+             border.col = "darkblue", 
+             shapes = 2,
+             legend.format = list(text.align="right", text.to.columns = TRUE)) +
+  tm_layout(main.title = "Nightingales recorded 2018",
+            compass.type = "4star",
+            legend.title.size = 1.4,
+            legend.text.size = 0.8, 
+            inner.margins = c(0.02,0.02,0.02,0.2))+
+  tm_compass(position = c("left", "bottom"),
+             size = 1) +
+  tm_scale_bar(position=c("left", "bottom")) +
+  tm_legend(position = c("right", "top"),
+            frame = TRUE,
+            bg.color="lightyellow",
+            title = "Berlin \nRes: 100m",
+            title.col = "grey40")
+```
+
+
+## Environmental data for all datasets 
+
+```{r load species observations and env variables}
+# species records: Jsdm
+breedingbirds_data <- read.csv(paste0(procdata_wd, "/Breeding_birds/Nightingale_abundance_transects.csv"))
+breedingbirds_transects <- read.csv(paste0(rawdata_wd, "/BreedingBirdMonitoringData_2017/Breeding_transects_variables.csv"))
+cbind.data.frame(breedingbirds_data$SITE, breedingbirds_transects$transect)
+breedingbirds <- breedingbirds_data %>%
+  mutate(transect = tolower(SITE),
+    Lm_presence = ifelse(Luscinia_megarhynchos >0, 1, 0)) %>%
+  mutate(transect = as.factor(transect)) %>%
+  dplyr::select(transect, Lm_presence) %>%
+  left_join(breedingbirds_transects, by = "transect") %>%
+  st_as_sf(coords = c("X", "Y"), crs = 25833) 
+  
+  
+# eBird
+eBird_presences_2018 <- read.csv(paste0(procdata_wd, "/eBird/ebd_marjul_201718_nightingale_all_presences.csv")) %>%
+  mutate(year = year(observation_date)) %>%
+  filter(year == 2018) %>%
+  st_as_sf(coords = c("longitude", "latitude"), crs = 4326) %>%
+  st_transform(crs = 25833)
+eBird_pa_2018 <- read.csv(paste0(procdata_wd, "/eBird/ebd_marjul_201718_nightingale_zf.csv")) %>%
+  mutate(year = year(observation_date)) %>%
+  filter(year == 2018) %>%
+  st_as_sf(coords = c("longitude", "latitude"), crs = 4326) %>%
+  st_transform(crs = 25833)
+eBird_pa_ss_2018 <- read.csv(paste0(procdata_wd, "/eBird/ebd_marjul201718_nightingale_zf_ss1km.csv")) %>%
+  mutate(year = year(observation_date)) %>%
+  filter(year == 2018) %>%
+  filter(protocol_type %in% c("Traveling", "Stationary")) %>%
+  st_as_sf(coords = c("longitude", "latitude"), crs = 4326) %>%
+  st_transform(crs = 25833)
+
+nrow(eBird_presences_2018)
+nrow(eBird_pa_2018)
+nrow(eBird_pa_ss_2018)
+table(eBird_pa_ss_2018$year, eBird_pa_ss_2018$species_observed)
+
+# Nachtigall project
+nightingales_2018 <- read.csv(paste0(procdata_wd, "/Nachtigall_project/Nightingales_corrected_2018_maxent.csv")) %>%
+  st_as_sf(coords = c("X", "Y"), crs = 25833) 
+
+# background and area polygons
+berlin <- read_sf(paste0(rawdata_wd, "/EnvCov/berlin_city_border_25833.gpkg"), crs = 25833) %>%
+  st_union()
+
+water <- read_sf(paste0(rawdata_wd, "/EnvCov/waterbodies_Berlin_25833.gpkg"))
+
+tree_raster <- raster(paste0(procdata_wd, "/ForPrediction/tree_100m.asc"))
+crs(tree_raster) <- CRS("+init=epsg:25833")
+# tree_raster <- projectRaster(tree_raster, crs = "+init=epsg:3035")
+
+background.pol <- read_sf(paste0(procdata_wd, "/Background1000m/background_polygon_1000m_25833.gpkg"), crs = 25833) %>%
+  st_union()
+class(background.pol)
+as_Spatial(background.pol)
+  
+# berlin environment
+env_cov <- stack(paste0(procdata_wd, "/ForPrediction/env_cov_berlin_100m_25833.tif")) 
+namefile2 <- read.csv(paste0(procdata_wd, "/ForPrediction/names_env_cov_berlin_100m_25833.csv"))
+names(env_cov) <- namefile2$x
+
+# background environment
+env_cov_bg <- stack(paste0(procdata_wd, "/Background1000m/env_cov_berlin1000m_100m_25833.tif")) 
+namefile <- read.csv(paste0(procdata_wd, "/Background1000m/names_env_cov_berlin1000m_100m_25833.csv"))
+names(env_cov_bg) <- namefile$x
+```
+
+
+## Reference map: nightingale predictions JSDM
+
+Load bird predictions from JSDM and select nightingales as reference map
+```{r}
+# load predictions
+raster_pred <- raster(paste0(results_wd, "/Nightingales_JSDM2017_predictions_100m_25833.tif"))
+
+# Plot the map for Nightingale (Luscinia megarhynchos)
+
+map.Lmegarhynchos <- tm_shape(raster_pred) +
+  tm_raster(title = "Nightingales JSDM",
+            palette = rev(viridis(10)),
+            style = "cont", 
+            breaks = c(0,2,4,6))+
+  tm_shape(water) +
+  tm_polygons("lightblue", border.col = NULL) +
+  tm_shape(berlin_out) +
+  tm_borders("ivory4", lwd = 2.5) +
+  tm_layout(main.title = "Abundance of Nightingale (JSDM)",
+            compass.type = "arrow",
+            legend.title.size = 0.8,
+            legend.text.size = 0.6, 
+            legend.bg.color = "white",
+            legend.position = c("right", "top"),
+            inner.margins = c(0.05,0.05,0.05,0.1),
+            legend.frame = TRUE)+
+  tm_compass(position = c("left", "bottom"),
+             size = 1.5) +
+  tm_scale_bar(position=c("left", "bottom"), 
+               size = 0.6) 
+
+map.Lmegarhynchos
+tmap_save(map.Lmegarhynchos, filename = paste0(results_wd, "/Map_Lmegarhynchos_JSDM_predictions.png"), 
+          dpi = 600)
+```
+
+
+## Extract environmental data 
+
+Extract observation values in predictor cells
+- ebird presences 2018
+- ebird pa spatial subsample 2018
+- nachtigall project 2018
+
+```{r select env variables}
+used_variables <- c("tree_100m", "ogreen_100m", "noise_100m", "hpop_100m", "preyabu_100m")
+used_envcov <- stack(c(env_cov$tree_100m, env_cov$ogreen_100m, env_cov$noise_100m, env_cov$hpop_100m, 
+                 env_cov$preyabu_100m))
+used_envcov_bg <- stack(c(env_cov_bg$tree_100m, env_cov_bg$ogreen_100m, env_cov_bg$noise_100m, env_cov_bg$hpop_100m, 
+                 env_cov_bg$preyabu_100m))
+berlin_envcov <- velox(used_envcov)
+
+#  All berlin
+berlin_cov <- as.data.frame(values(used_envcov))
+berlin_cov$dataset <- "All_Berlin"
+colnames(berlin_cov)
+head(berlin_cov)
+
+# Background 1000m 
+background_cov <- as.data.frame(values(used_envcov_bg))
+background_cov$dataset <- "Background_1000m"
+head(background_cov)
+colnames(background_cov)
+
+# Standardized transects
+extraction_transects <- breedingbirds_transects %>%
+  dplyr::select(tree, o.green, noise, pop, prey) %>%
+  rename_all(~used_variables) %>%
+  mutate(dataset = "Breeding_birds")
+
+# ebird records 2018 - presences
+extraction_bird_pres <- berlin_envcov$extract_points(sp=eBird_presences_2018)
+extraction_bird_pres <- as.data.frame(extraction_bird_pres) 
+colnames(extraction_bird_pres) <- used_variables
+extraction_bird_pres$dataset <- "eBird_presences"
+head(extraction_bird_pres)
+
+# ebird records 2018 - presence/absence spatial subsample 1 km
+extraction_ebird_pass <- berlin_envcov$extract_points(sp=eBird_pa_ss_2018) %>%
+  as.data.frame() %>%
+  rename_all(~used_variables) %>%
+  mutate(dataset = "eBird_pa_ss")
+
+# Nachtigall project
+extraction_nachtigall <- berlin_envcov$extract_points(sp=nightingales_2018) %>%
+  as.data.frame() %>%
+  rename_all(~used_variables) %>%
+  mutate(dataset = "Nachtigall_2018")
+
+# Combine into new data frame all values
+environmental_values <- rbind(berlin_cov, background_cov, extraction_transects, 
+                        extraction_bird_pres, extraction_ebird_pass, 
+                        extraction_nachtigall)
+head(environmental_values)
+summary(environmental_values)
+
+for (i in 1:ncol(extraction_berlin_ng_envcov)){
+  print(colnames(extraction_berlin_ng_envcov[i]))
+  print(range(extraction_berlin_ng_envcov[,i], na.rm=TRUE))
+}
+  
+for (i in 1:ncol(berlin_cov)){
+   print(colnames(berlin_cov[i]))
+  print(range(berlin_cov[,i], na.rm=TRUE))
+}
+
+for (i in 1:ncol(background_cov)){
+   print(colnames(background_cov[i]))
+  print(range(background_cov[,i], na.rm=TRUE))
+}
+
+# values for the observations, without berlin and background
+unique(environmental_values$dataset)
+
+environmental_values_obs <- environmental_values %>%
+  filter(dataset %in% c("Breeding_birds", "eBird_pa_ss", "Nachtigall_2018")) %>%
+  mutate(dataset = as.factor(dataset)) %>%
+  droplevels()
+str(environmental_values_obs)
+
+# mean values of each group
+mu_all <- environmental_values %>%
+  group_by(dataset) %>%
+  summarise(tree.mean = mean(tree_100m, na.rm = TRUE), 
+            ogreen.mean = mean(ogreen_100m, na.rm = TRUE), 
+            noise.mean = mean(noise_100m, na.rm = TRUE), 
+            hpop.mean = mean(hpop_100m, na.rm = TRUE), 
+            prey.mean = mean(preyabu_100m, na.rm = TRUE), 
+            tree.sd = sd(tree_100m, na.rm = TRUE),
+            ogreen.sd = sd(ogreen_100m, na.rm = TRUE), 
+            noise.sd = sd(noise_100m, na.rm = TRUE), 
+            hpop.sd = sd(hpop_100m, na.rm = TRUE), 
+            prey.sd = sd(preyabu_100m, na.rm = TRUE))
+# mean for plotting only observations
+mu <- mu_all %>%
+  filter(dataset %in% c("Breeding_birds", "eBird_pa_ss", "Nachtigall_2018")) %>%
+  mutate(dataset = as.factor(dataset)) %>%
+  droplevels()
+
+# save environmental values
+write.csv(environmental_values, paste0(results_wd, "/Values_used_envcov_obs_background_berlin.csv"), row.names = FALSE)
+```
+
+## get environmental values histograms 
+
+```{r histograms for all env values}
+for (i in 1:ncol(environmental_values)){
+  ggplot(environmental_values, aes(environmental_values[,i], fill = dataset)) + 
+  geom_density(alpha = 0.2) +
+  theme_bw() +
+  theme(panel.grid = element_blank()) +
+  xlab(colnames(environmental_values)[i])
+  ggsave(filename = paste0(results_wd, "/interim_results/Plot_", colnames(environmental_values)[i], "_obs_berlin.png"))
+}
+
+ggplot(environmental_values, aes(tree_100m, fill = dataset)) + 
+  geom_density(alpha = 0.2) +
+  theme_bw() +
+  theme(panel.grid = element_blank())
+
+ggplot(all_covariates, aes(tree_100m, fill = dataset)) + 
+   geom_histogram(alpha = 0.5, aes(y = ..density..), position = 'identity')
+```
+
+```{r histograms env for observations}
+(hist_tree <- ggplot(environmental_values_obs, aes(x=tree_100m, fill = dataset)) + 
+geom_histogram(aes(y=stat(width*density)), position = "identity",
+               colour="white", alpha = 0.7)+
+  # geom_histogram(position = "identity",
+  #              colour="white", fill="darkblue", alpha = 0.7)+
+  # geom_density(aes(y=..density..*3.2, fill = dataset), color = "white", alpha=.4, size = 1) +
+  geom_vline(data = mu, aes(xintercept=tree.mean, color = dataset),
+                   # mean(tree, na.rm=T), color = dataset),
+            # linetype=c("longdash", "dotdash", "dashed"), size=1.5) +
+            linetype = "dashed", size = 1.5) +
+  scale_fill_manual(values = c("#08088A", "grey30", "darkorange"), 
+                    labels = c("Breeding birds", "eBird", "Nachtigall"))+
+  scale_color_manual(values = c("#0B0B61", "grey30", "darkorange"), 
+                     guide = FALSE)+
+  labs(title = "Histogram of environmental values for observations", 
+       x = "\nTree cover (%)",
+       y = "Observations (%)\n", 
+       fill = "Data type") +
+  ylim(c(0,0.10))+
+  scale_y_continuous(labels = scales::percent)+
+  theme_classic() +
+  theme(axis.title = element_text(size = 20), 
+        axis.text = element_text(size = 16, color = "black"), 
+        legend.title = element_text(size = 16), 
+        legend.text = element_text(size = 14)) )
+  
+ggsave(plot = hist_tree, paste0(results_wd, "/final_results/Histogram_treecover_observationtype.png"), 
+       dpi = 600, width = 7, height = 5)
+
+(hist_ogreen <- ggplot(environmental_values_obs, aes(x=ogreen_100m*100, fill = dataset)) + 
+geom_histogram(aes(y=stat(width*density)), position = "identity",
+               colour="white", alpha = 0.7)+
+  # geom_histogram(position = "identity",
+  #              colour="white", fill="darkblue", alpha = 0.7)+
+  # geom_density(aes(y=..density..*5, fill = dataset), color = "white", alpha=.4, size = 1) +
+  geom_vline(data = mu, aes(xintercept=ogreen.mean*100, color = dataset),
+                   # mean(tree, na.rm=T), color = dataset),
+            linetype = "dashed", size = 1.5) +
+  scale_fill_manual(values = c("#08088A", "grey30", "darkorange"), 
+                    labels = c("Breeding birds", "eBird", "Nachtigall"))+
+  scale_color_manual(values = c("#0B0B61", "grey30", "darkorange"), 
+                     guide = FALSE)+
+  labs(title = "Histogram of environmental values for observations", 
+       x = "\nOpen green area (%)",
+       y = "Observations (%)\n", 
+       fill = "Data type") +
+  scale_y_continuous(labels=scales::percent)+
+  theme_classic() +
+  theme(axis.title = element_text(size = 20), 
+        axis.text = element_text(size = 16, color = "black"), 
+        legend.title = element_text(size = 16), 
+        legend.text = element_text(size = 14)) )
+  
+ggsave(plot = hist_ogreen, paste0(results_wd, "/final_results/Histogram_ogreen_observationtype.png"), 
+       dpi = 600, width = 7, height = 5)
+
+
+(hist_noise <- ggplot(environmental_values_obs, aes(x=noise_100m, fill = dataset)) + 
+geom_histogram(aes(y=stat(width*density)), position = "identity",
+               colour="white", alpha = 0.7)+
+  # geom_histogram(position = "identity",
+  #              colour="white", fill="darkblue", alpha = 0.7)+
+  # geom_density(aes(y=..density..*2, fill = dataset), color = "white", alpha=.4, size = 1) +
+  geom_vline(data = mu, aes(xintercept=noise.mean, color = dataset),
+                   # mean(tree, na.rm=T), color = dataset),
+            linetype = "dashed", size = 1.5) +
+  scale_fill_manual(values = c("#08088A", "grey30", "darkorange"), 
+                    labels = c("Breeding birds", "eBird", "Nachtigall"))+
+  scale_color_manual(values = c("#0B0B61", "grey30", "darkorange"), 
+                     guide = FALSE)+
+  labs(title = "Histogram of environmental values for observations", 
+       x = "\nNoise (dBA)",
+       y = "Observations (%)\n", 
+       fill = "Data type") +
+  scale_y_continuous(labels=scales::percent)+
+  theme_classic() +
+  theme(axis.title = element_text(size = 20), 
+        axis.text = element_text(size = 16, color = "black"), 
+        legend.title = element_text(size = 16), 
+        legend.text = element_text(size = 14)) )
+ggsave(plot = hist_noise, paste0(results_wd, "/final_results/Histogram_noise_observationtype.png"), 
+       dpi = 600, width = 7, height = 5)
+
+
+(hist_hpop <- ggplot(environmental_values_obs, aes(x=hpop_100m, fill = dataset)) + 
+geom_histogram(aes(y=stat(width*density)), position = "identity",
+               colour="white", alpha = 0.7)+
+  # geom_histogram(position = "identity",
+  #              colour="white", fill="darkblue", alpha = 0.7)+
+  # geom_density(aes(y=..density..*20, fill = dataset), color = "white", alpha=.4, size = 1) +
+  geom_vline(data = mu, aes(xintercept=hpop.mean, color = dataset),
+                   # mean(tree, na.rm=T), color = dataset),
+            linetype = "dashed", size = 1.5) +
+ scale_fill_manual(values = c("#08088A", "grey30", "darkorange"), 
+                    labels = c("Breeding birds", "eBird", "Nachtigall"))+
+  scale_color_manual(values = c("#0B0B61", "grey30", "darkorange"), 
+                     guide = FALSE)+
+  labs(title = "Histogram of environmental values for observations", 
+       x = "\nHuman population (people/ha)",
+       y = "Observations (%)\n", 
+       fill = "Data type") +
+  scale_y_continuous(labels=scales::percent)+
+  theme_classic() +
+  theme(axis.title = element_text(size = 20), 
+        axis.text = element_text(size = 16, color = "black"), 
+        legend.title = element_text(size = 16), 
+        legend.text = element_text(size = 14)) )
+ggsave(plot = hist_hpop, paste0(results_wd, "/final_results/Histogram_hpop_observationtype.png"), 
+       dpi = 600, width = 7, height = 5)
+
+
+(hist_prey <- ggplot(environmental_values_obs, aes(x=preyabu_100m, fill = dataset)) + 
+geom_histogram(aes(y=stat(width*density)), position = "identity",
+               colour="white", alpha = 0.7)+
+  # geom_histogram(position = "identity",
+  #              colour="white", fill="darkblue", alpha = 0.7)+
+  # geom_density(aes(y=..density..*10, fill = dataset), color = "white", alpha=.4, size = 1) +
+  geom_vline(data = mu, aes(xintercept=prey.mean, color = dataset),
+                   # mean(tree, na.rm=T), color = dataset),
+            linetype = "dashed", size = 1.5) +
+  scale_fill_manual(values = c("#08088A", "grey30", "darkorange"), 
+                    labels = c("Breeding birds", "eBird", "Nachtigall"))+
+  scale_color_manual(values = c("#0B0B61", "grey30", "darkorange"), 
+                     guide = FALSE)+
+  labs(title = "Histogram of environmental values for observations", 
+       x = "\nPrey abundance",
+       y = "Observations (%)\n", 
+       fill = "Data type") +
+  scale_y_continuous(labels=scales::percent)+
+  theme_classic() +
+  theme(axis.title = element_text(size = 20), 
+        axis.text = element_text(size = 16, color = "black"), 
+        legend.title = element_text(size = 16), 
+        legend.text = element_text(size = 14)) )
+ggsave(plot = hist_prey, paste0(results_wd, "/final_results/Histogram_prey_observationtype.png"), 
+       dpi = 600, width = 7, height = 5)
+```
+
+
+# Get CS observations in JSDM cells #
+All observations from nachtigall project and ebird
+
+```{r load observation data}
+nachtigall_jsdm <- as.data.frame(extract(raster_pred, nightingales_2018, cellnumbers = TRUE)) %>%
+  mutate(dataset = "Nachtigall2018")
+
+eBird_pa_ss_2018_presences <- eBird_pa_ss_2018 %>%
+  filter(species_observed)
+ebird_jsdm <- as.data.frame(extract(raster_pred, eBird_pa_ss_2018_presences, cellnumbers = TRUE)) %>%
+  mutate(dataset = "eBird_pa_ss") 
+
+# Make 0 predictions with negative values
+nachtigall_jsdm$NG_predictions[nachtigall_jsdm$NG_predictions < 0] <- 0
+ebird_jsdm$NG_predictions[ebird_jsdm$NG_predictions < 0] <- 0
+
+nrow(nightingales_2018)
+nrow(nachtigall_jsdm)
+nrow(eBird_pa_ss_2018_presences)
+nrow(ebird_jsdm)
+
+# all values
+#median value: 50% of the observations
+median(nachtigall_jsdm$NG_predictions, na.rm=TRUE)
+
+median(ebird_jsdm$NG_predictions, na.rm = TRUE)
+
+### Plot for nachtigall project
+ggplot(nachtigall_jsdm, aes(x=NG_predictions)) + 
+  geom_histogram(binwidth = 0.5, position = "identity",
+               colour="white", fill="darkblue", alpha = 0.7)+
+  geom_vline(aes(xintercept=median(raster_pred, na.rm=T)),
+            color="orange", linetype="dashed", size=1.5) +
+  labs(title = "Histogram of observations", 
+       x = "\nPredicted nightingale abundance",
+       y = "Number of observations\n") +
+  xlim(c(-0.5,6))+
+  theme_classic() +
+  theme(axis.title = element_text(size = 20), 
+        axis.text = element_text(size = 16)) +
+  annotate("text", label = paste0("Total = ",
+                  nrow(nachtigall_jsdm), " observations"), 
+            x = 4.5, y = 420) +
+  annotate("rect", xmin = 3.5, xmax = 5.5, 
+           ymin = 400, ymax = 440,
+           color = "black", fill = NA)
+
+### Plot for ebird and nachtigall together
+# all data from ebird: presences
+
+# only using the cells (1 point by cell)
+duplicated(nachtigall_jsdm)
+
+nachtigall_jsdm_filtered <- nachtigall_jsdm %>% 
+  distinct() # remove duplicates
+
+# To get the data visible: We create 100 copies of ebird and add a secondary 
+# axis divided by 100 to account for this
+ebird_jsdm_cheat <-  ebird_jsdm %>%
+slice(rep(1:n(), each = 100))
+
+obs_jsdm_filtered <- rbind(nachtigall_jsdm_filtered, ebird_jsdm_cheat)
+
+head(obs_jsdm_filtered)
+
+median_ebird <- median(ebird_jsdm$NG_predictions, na.rm = TRUE)
+median_nachtigall <- median(nachtigall_jsdm_filtered$NG_predictions, na.rm = TRUE)
+
+
+ggplot(obs_jsdm_filtered, aes(x=NG_predictions, color = dataset, fill = dataset)) + 
+  geom_histogram(binwidth = 0.5, position = "identity",
+               colour="white", alpha = 0.7)+
+  geom_vline(aes(xintercept=median_nachtigall),
+            color="grey30", linetype="dotdash", size=1.5) +
+  geom_vline(aes(xintercept=median_ebird), 
+             color = "darkorange4", linetype = "dotdash", size = 1.5)+
+  scale_fill_manual(values = c("grey50", "darkorange"),
+                    labels = c("eBird", "Nachtigall")) +
+  labs(title = "Histogram of cell with observations values",
+       x = "\nPredicted nightingale abundance",
+       y = "Number of observations\n") +
+  xlim(c(-0.5,6))+
+  scale_y_continuous(
+    "Number of observations\n", 
+    sec.axis = sec_axis(~ . / 100, name = "Number of observations\n")
+  ) +
+  theme_classic() +
+  theme(axis.title = element_text(size = 16), 
+        axis.text = element_text(size = 12, color = "black"), 
+        legend.title = element_text(size = 12),
+        legend.text = element_text(size = 10)) +
+  annotate("rect", xmin = 4, xmax = 6, 
+           ymin = 265, ymax = 295,
+           color = "black", fill = "darkorange", alpha = 0.5) +
+  annotate("text", label = paste0("Total: ", nrow(nachtigall_jsdm_filtered), " cells"), 
+           size = 4, x = 5, y = 280) +
+  annotate("rect", xmin = 4, xmax = 6, 
+           ymin = 300, ymax = 330,
+           color = "black", fill = "grey50", alpha = 0.5) +
+  annotate("text", label = paste0("Total: ", nrow(ebird_jsdm), " cells"),
+           size = 4, x = 5, y = 315) 
+  
+ggsave(paste0(results_wd, "/final_results/Histogram_cellvalues_jsdm_observations.png"), 
+       dpi = 600, width = 8, height = 5)
+```
+
+
+```{r plot ebird pa}
+ebird_jsdm_pa <- as.data.frame(extract(raster_pred, eBird_pa_ss_2018, cellnumbers = TRUE)) %>%
+  mutate(dataset = "eBird_pa_ss") %>%
+  rename(NG_predictions = Nightingales_JSDM2017_predictions_100m_25833)
+ebird_jsdm_pa <- cbind(ebird_jsdm_pa, species_observed = eBird_pa_ss_2018$species_observed)
+head(ebird_jsdm_pa)
+
+medians_ebird <- ebird_jsdm_pa %>%
+  group_by(species_observed) %>%
+  summarise(median = median(NG_predictions, na.rm = TRUE))
+            
+ggplot(ebird_jsdm_pa, aes(x=NG_predictions, color = species_observed, fill = species_observed)) + 
+  geom_histogram(binwidth = 0.5, position = "identity",
+               colour="white", alpha = 0.7)+
+  geom_vline(aes(xintercept=medians_ebird$median[1]),
+            color="darkorange4", linetype="dotdash", size=1.5) +
+  geom_vline(aes(xintercept=medians_ebird$median[2]),
+             color = "grey30", linetype = "dotdash", size = 1.5)+
+  scale_fill_manual(values = c("darkorange", "grey50"),
+                    labels = c("absences", "presences")) +
+  labs(title = "Histogram of cell with observations values",
+       x = "\nPredicted nightingale abundance",
+       y = "Number of observations\n") +
+  xlim(c(-0.5,6))+
+  theme_classic() +
+  theme(axis.title = element_text(size = 16), 
+        axis.text = element_text(size = 12, color = "black"), 
+        legend.title = element_text(size = 12),
+        legend.text = element_text(size = 10)) +
+  annotate("rect", xmin = 4, xmax = 6, 
+           ymin = 6.8, ymax = 8.1,
+           color = "black", fill = "darkorange", alpha = 0.5) +
+  annotate("text", label = paste0("Total: ", nrow(ebird_jsdm_pa[ebird_jsdm_pa$species_observed == FALSE,]), " cells"), 
+           size = 4, x = 5, y = 7.5) +
+  annotate("rect", xmin = 4, xmax = 6, 
+           ymin = 5.2, ymax = 6.5,
+           color = "black", fill = "grey50", alpha = 0.5) +
+  annotate("text", label = paste0("Total: ", nrow(ebird_jsdm_pa[ebird_jsdm_pa$species_observed == TRUE,]), " cells"),
+           size = 4, x = 5, y = 6) 
+  
+ggsave(paste0(results_wd, "/final_results/Histogram_cellvalues_jsdm_ebird_pa.png"), 
+       dpi = 600, width = 8, height = 5)
+```
