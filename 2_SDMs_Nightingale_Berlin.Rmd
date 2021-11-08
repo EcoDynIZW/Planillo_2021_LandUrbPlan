@@ -1,0 +1,1018 @@
+---
+title: "2_SDMs_nightingales"
+author: "Aimara Planillo"
+date: "11/8/2021"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# SDM Nightingales Berlin
+
+Different species distribution models based on the three datasets for Nightingales
+in Berlin
+
+- JSDM data (standardized data)
+- eBird (semi-structured data)
+- Forschungsfall Nachtigall Project (opportunistic unstructured data)
+
+
+```{r packages}
+source("./CS_SDM_NightingaleBerlin/source_packages.R")
+```
+
+```{r define workspace}
+Work_dir <- getwd()
+
+rawdata_wd <- file.path(Work_dir, "/2_Raw_data/BreedingMonitoringData2017")
+procdata_wd <- file.path(Work_dir, "/4_Processed_data")
+output_wd <- file.path(Work_dir, "5_Results/BreedingMonitoring2017")
+```
+
+
+```{r general spatial data}
+# spatial data 
+berlin <- read_sf("2_Raw_data/EnvCov/berlin_city_border_25833.gpkg", crs = 25833)
+water <- read_sf("2_Raw_data/EnvCov/waterbodies_Berlin_25833.gpkg", crs = 25833)
+# env variables
+env_stack <- stack(paste0(procdata_wd, "/ForPrediction/env_cov_berlin_100m_25833.tif"))
+```
+
+
+########################################
+## Standardized data - Binomial model ##
+########################################
+
+```{r load standardized observations}
+# standardized monitoring observations
+NG2017 <- read.csv(paste0(rawdata_wd,
+                          "/Nightingales2017_BreedingBirdSurvey.csv"))
+# monitoring transect variabels
+transects <- read.csv(paste0(rawdata_wd,
+                             "/Breeding_transects_variables.csv"))
+# env variables for monitoring transects
+for_predict_cov <- read.csv(paste0(rawdata_wd,
+                             "/grid_topredict_100mres_birds_noNA.csv"))
+
+All_data <- cbind(transects, NG2017[,2:3])
+All_data <- All_data %>%
+  mutate(Lm_presence = ifelse(Lm_counts >0, 1,0))
+All_data
+
+colnames(All_data)
+predict_cov <- for_predict_cov %>%
+  rename(tree = tree.100m, 
+         o.green = open.green100m,
+         noise = noise.100m,
+         pop = pop.100m, 
+         prey = prey.abu) %>%
+  select(x, y, tree, o.green, noise, pop, prey)
+head(predict_cov)
+
+```
+
+```{r binomial glm standardized data}
+ng_binomial <- glm(Lm_presence ~ (scale(tree) + scale(o.green) + 
+                                      scale(noise) + scale(pop)) * 
+                       scale(prey),
+                   data = All_data, 
+                   family = "binomial")
+summary(ng_binomial)
+
+plot(allEffects(ng_binomial))
+
+# Evaluate model with AUC
+pred_binomial <- predict(ng_binomial, type = "response")
+All_data$predicts <- pred_binomial
+
+g <- roc(Lm_presence ~ predicts, data = All_data)
+plot(g)
+
+#create new covariate values within observed range for predictions
+pred1 <- data.frame(o.green = seq(from = 0,
+                                    to = 1, by = 0.05), 
+                    tree = mean(All_data$tree), 
+                    noise = mean(All_data$noise), 
+                    pop = mean(All_data$pop),
+                    prey = mean(All_data$prey))
+
+Pred <- predict(ng_binomial, newdata = pred1, type = "response")
+
+plot(x = All_data$o.green, y = All_data$Lm_presence)
+lines(pred1$o.green, Pred)
+
+## predict binomial model for Berlin
+pred_binomial <- predict(ng_binomial, newdata = predict_cov, type = "response", re.form = ~0)
+
+predict_cov$predictions <- pred_binomial
+head(predict_cov, 10)
+```
+
+```{r put binomial model predictions in a raster}
+# use env raster as template
+tree_raster <- env_stack$env_cov_berlin_100m_25833.2
+prediction_raster <- raster(tree_raster)
+
+# extract the cell numbers that correspond with the cells with predicitons 
+# based on coordinates
+cells <- cellFromXY(prediction_raster, as.matrix(predict_cov[, c("x", "y")]))
+
+# Assign values to raster cells
+prediction_raster[cells] <- predict_cov$predictions
+prediction_raster <- mask(prediction_raster, berlin)
+plot(prediction_raster)
+
+writeRaster(prediction_raster, paste0(output_wd, "/raster_binomial_prediction_100m_25833.tif"), 
+            overwrite = TRUE)
+
+#Plot predictions 
+tmap_mode("plot")
+tm_shape(prediction_raster) +
+  tm_raster(palette = rev(viridis(10)), 
+            title = "Binomial prediction")+
+  tm_shape(water) +
+  tm_polygons("lightblue", border.col = NULL)+
+   tm_layout(main.title = "Binomial GLM prediction Nightingales 2017\nselected covariates", 
+            compass.type = "arrow",
+            legend.title.size = 0.8,
+            legend.text.size = 0.6, 
+          legend.bg.color = "white",
+          legend.position = c("right", "top"),
+            inner.margins = c(0.05,0.05,0.05,0.1),
+          legend.frame = TRUE)+
+  tm_compass(position = c("left", "bottom"),
+             size = 1.5) +
+  tm_scale_bar(position=c("left", "bottom"), 
+               size = 0.6) +
+  tm_credits(paste0("AUC = ", round(g$auc[1],3)), position=c("left", "top"))
+
+tmap_save(filename = paste0(output_wd, "/Predictions_binomial_2017.png"))
+```
+
+
+
+#################################################
+## Semi-structured data - eBird Binomial model ##
+#################################################
+
+```{r load and prepare ebird data}
+# species observation data
+eBird_data <- read.csv(paste0(procdata_wd,
+                          "/eBird/ebd_marjul201718_nightingale_zf_ss1km.csv"))
+table(eBird_data$species_observed, year(eBird_data$observation_date))
+
+eBird_data_proj <- st_as_sf(eBird_data, coords = c("longitude", "latitude"), crs = 4326) %>%
+  st_transform(crs = 25833) 
+
+# extract coordinates cells 100m ebirds with observations
+r_tree <- raster(paste0(rawdata_wd, "/EnvCov/tree_cover_20m_25833.tif")) 
+plot(r_tree)
+
+r_agg <- aggregate(r_tree, fact = 5)
+
+plot(r_agg)
+plot(st_geometry(eBird_data_proj), add = TRUE)
+
+p <- as(r_agg, 'SpatialPixels')
+p1 <- as.data.frame(p)
+
+# get cells form projected nightingales observations
+cells.ebird <- cellFromXY(r_agg, st_coordinates(eBird_data_proj)[, c("X", "Y")]) 
+cells.envcov <- cellFromXY(r_agg, as.matrix(envcov)[, c("x", "y")])
+
+envcov_cells <- cbind(envcov, cells.envcov)
+
+All_data_ebird <- cbind(eBird_data, cells.ebird)
+```
+
+```{r run binomial model for semi-structured ebird data}
+data_ebird_models_2018 <- All_data_ebird %>%
+  mutate(Lm_presence = ifelse(species_observed == TRUE, 1,0)) %>%
+  mutate(year = year(observation_date)) %>%
+  filter(year == 2018) %>%
+  filter(protocol_type %in% c("Stationary", "Traveling")) %>%
+  left_join(envcov_cells, by = c("cells.ebird" = "cells.envcov"))
+  
+table(data_ebird_models_2018$Lm_presence)
+
+colnames(data_ebird_models_2018)
+
+# Binomial GLM include effort covariates 2018
+data_ebird_models_2018 <- data_ebird_models_2018 %>%
+  mutate(day = yday(observation_date)) 
+
+colnames(data_ebird_models_2018)
+
+ng_binomial_effort_2018 <- glm(Lm_presence ~ (scale(tree.100m) + scale(open.green100m) + 
+                                      scale(noise.100m) + scale(pop.100m)) * 
+                          scale(prey.abu) + 
+                          day + time_observations_started + duration_minutes + number_observers +
+                          protocol_type + effort_distance_km,
+                   data = data_ebird_models_2018, 
+                   family = "binomial")
+summary(ng_binomial_effort_2018)
+
+plot(allEffects(ng_binomial_effort_2018))
+
+testDispersion(ng_binomial_effort_2018)
+modeleffort2018_Output <- simulateResiduals(fittedModel = ng_binomial_effort_2018, plot = T)
+testResiduals(modeleffort2018_Output)
+
+# Evaluate model effort 2018 with AUC
+pred_binomial_effort2018 <- predict(ng_binomial_effort_2018, type = "response")
+data_ebird_models_2018$predicts_effort <- pred_binomial_effort2018
+
+g_effort2018 <- roc(Lm_presence ~ predicts_effort, data = data_ebird_models_2018)
+g_effort2018
+plot(g_effort2018)
+
+#create new covariate values within observed range for predictions
+# example open green area
+# to get the hour with max detections
+summary(data_ebird_models_2018$time_observations_started)
+hist(data_ebird_models_2018$time_observations_started, breaks = seq(4,22, by = 1))
+# Higher freq at 9
+
+pred_effort2018 <- data_ebird_models_2018 %>%
+  mutate(open.green100m = seq(from = 0,
+                                    to = 1, length.out = nrow(data_ebird_models_2018)), 
+         tree.100m = mean(tree.100m),
+         noise.100m = mean(noise.100m), 
+         pop.100m = mean(pop.100m),
+         prey.abu = mean(prey.abu), 
+         day = median(day), 
+         time_observations_started = 9, # higher observations
+         duration_minutes = 60, # standardized to 1 hour
+         number_observers = 1, # standardized to 1 observer
+         protocol_type = "Traveling", # standardized to travelling protocol
+         effort_distance_km = 1) # standardized to 1 km
+
+Pred_effort <- predict(ng_binomial_effort_2018, newdata = pred_effort2018, type = "response")
+
+plot(x = data_ebird_models_2018$open.green100m, y = data_ebird_models_2018$Lm_presence)
+lines(pred_effort2018$open.green100m, Pred_effort)
+```
+
+```{r predict semi-structured ebird binomial model berlin}
+pred_binomial2018 <- predict(ng_binomial_2018, newdata = envcov, type = "response", re.form = ~0)
+
+envcov$predictions2018 <- pred_binomial2018
+head(envcov, 10)
+
+# add effort to environmental covariates to predict
+envcov_effort2018 <- envcov %>%
+  mutate(day = median(data_ebird_models_2018$day), 
+         time_observations_started = 10, # higher observations
+         duration_minutes = 60, # standardized to 1 hour
+         number_observers = 1, # standardized to 1 observer
+         protocol_type = "Traveling", # standardized to travelling protocol
+         effort_distance_km = 1) # standardized to 1 km
+  
+pred_binomial_effort2018 <- predict(ng_binomial_effort_2018, newdata = envcov_effort2018, type = "response", re.form = ~0)
+
+envcov_effort2018$predictions2018 <- pred_binomial_effort2018
+head(envcov_effort2018, 10)
+```
+
+```{r plot prediction map semi-structured ebird binomial model}
+# Assign values to raster cells
+prediction_raster_effort2018 <- prediction_raster
+prediction_raster_effort2018[cells] <- envcov_effort2018$predictions2018
+prediction_raster_effort2018 <- mask(prediction_raster_effort2018, berlin)
+plot(prediction_raster_effort2018)
+
+writeRaster(prediction_raster_effort2018, paste0(results_wd, "/raster_binomial_prediction_effort_2018_100m_25833.tif"), 
+            overwrite = TRUE)
+
+# binomial model, with effort
+tmap_mode("plot")
+
+tm_shape(prediction_raster_effort2018) +
+  tm_raster(palette = rev(viridis(10)), 
+            title = "Binomial prediction with effort")+
+  tm_shape(water) +
+  tm_polygons("lightblue", border.col = NULL)+
+   tm_layout(main.title = "Binomial GLM prediction Nightingales 2018\neBird data - selected covariates + effort", 
+            compass.type = "arrow",
+            legend.title.size = 0.8,
+            legend.text.size = 0.6, 
+          legend.bg.color = "white",
+          legend.position = c("right", "top"),
+            inner.margins = c(0.05,0.05,0.05,0.1),
+          legend.frame = TRUE)+
+  tm_compass(position = c("left", "bottom"),
+             size = 1.5) +
+  tm_scale_bar(position=c("left", "bottom"), 
+               size = 0.6) +
+  tm_credits(paste0("AUC = ", round(g_effort2018$auc[1],3)), position=c("left", "top"))
+
+tmap_save(filename = paste0(results_wd, "/Predictions_binomial_effort_2018_ebird.png"))
+```
+
+
+
+###############################################
+## Semi-structured data - ebird MaxEnt model ##
+###############################################
+
+```{r load data for ebird maxent}
+eBird_maxent_data <- read.csv(paste0(procdata_wd, "/eBird/ebd_marjul_201718_nightingale_all_presences.csv"))
+
+eBird_maxent_data_2018 <- eBird_maxent_data %>% 
+  mutate(year = year(observation_date)) %>%
+  filter(year == 2018) %>% 
+  st_as_sf(coords = c("longitude", "latitude"), crs = 4326) %>%
+  st_transform(crs = 25833) %>%
+  st_coordinates() %>%
+  as.data.frame() 
+
+# berlin environment
+tree_100m <- raster(paste0(procdata_wd, "/ForPrediction/tree_100m.asc"), crs = CRS('+init=EPSG:25833'))
+ogreen_100m <- raster(paste0(procdata_wd, "/ForPrediction/ogreen_100m.asc"), crs = CRS('+init=EPSG:25833'))
+noise_100m <- raster(paste0(procdata_wd, "/ForPrediction/noise_100m.asc"), crs = CRS('+init=EPSG:25833'))
+hpop_100m <- raster(paste0(procdata_wd, "/ForPrediction/hpop_100m.asc"), crs = CRS('+init=EPSG:25833'))
+preyabu <- raster(paste0(procdata_wd, "/ForPrediction/preyabu_100m.asc"), crs = CRS('+init=EPSG:25833'))
+env_cov <- stack(tree_100m, ogreen_100m, noise_100m, hpop_100m, preyabu)
+names(env_cov) <- c("tree_100m", "ogreen_100m", "noise_100m", "hpop_100m", "preyabu_100m")
+env_cov <- mask(env_cov, berlin)
+
+plot(env_cov)
+
+# divide in training and test data
+set.seed(102) # set seed for reproducibility
+group <- kfold(eBird_maxent_data_2018, 5)
+pres_train2018 <- as.data.frame(eBird_maxent_data_2018[group != 1, ])
+pres_test2018 <- as.data.frame(eBird_maxent_data_2018[group == 1, ])
+
+# select random points
+bg_2018 <- randomPoints(env_cov, 10000)
+
+# divide in training and test background points
+set.seed(102)
+group <- kfold(bg, 5)
+bg_train2018 <- as.data.frame(bg[group != 1, ])
+bg_test2018 <- as.data.frame(bg[group == 1, ])
+
+```
+
+```{r run maxent model ebird}
+# specifying background and presence points for training the model
+maxent_ebird2018 <- maxent(x = env_cov, p = pres_train2018, a = bg_train2018,
+                  removeDuplicates = TRUE, path = paste0(results_wd, "/Maxent2018"))
+
+# evaluate model - training points
+eval.maxent2018 <- evaluate(p = pres_train2018, a = bg_train2018, maxent_ebird2018, env_cov)
+eval.maxent2018
+
+# evaluate model - test points
+eval.maxent2018_test <- evaluate(p = pres_test2018, a = bg_test2018, maxent_ebird2018, env_cov)
+eval.maxent2018_test
+
+# Covariate effects and importance
+png(paste0(results_wd, "/Covariate_responses2018.png"))
+response(maxent_ebird2018)
+dev.off()
+
+png(paste0(results_wd, "/Covariate_importance2018.png"))
+plot(maxent_ebird2018)
+dev.off()
+
+var_imp <- plot(maxent_ebird2018)
+write.csv(as.data.frame(var_imp), paste0(results_wd, "/Covariate_importance_maxent_2018.csv"))
+```
+
+```{r predict ebird maxent Berlin}
+# predict model
+pberlin.maxentebird2018 <- predict(env_cov, maxent_ebird2018, progress='')
+
+png(paste0(results_wd, "/Prediction_berlin2018.png"), 
+    width = 3000, height = 2000, pointsize = 30)
+
+plot(pberlin.maxentebird2018, main='Maxent, raw values')
+plot(st_geometry(berlin), add=TRUE, border='dark grey')
+dev.off()
+
+writeRaster(pberlin.maxentebird2018, paste0(results_wd, "/Maxent_ebird_2018_raster_100m_25833.tif"))
+```
+
+```{r plot map predictions ebird maxent Berlin}
+tmap_mode("plot")
+tm_shape(pberlin.maxentebird2018) +
+  tm_raster(palette = rev(viridis(10)), 
+            title = "Maxent, raw values")+
+  tm_shape(water) +
+  tm_polygons("lightblue", border.col = NULL)+
+   tm_layout(main.title = "Maxent prediction Nightingales 2018\neBird - selected covariates", 
+            compass.type = "arrow",
+            legend.title.size = 0.8,
+            legend.text.size = 0.6, 
+          legend.bg.color = "white",
+          legend.position = c("right", "top"),
+            inner.margins = c(0.05,0.05,0.05,0.1),
+          legend.frame = TRUE)+
+  tm_compass(position = c("left", "bottom"),
+             size = 1.5) +
+  tm_scale_bar(position=c("left", "bottom"), 
+               size = 0.6) +
+  tm_credits(paste0("AUC (test)= ", round(eval.maxent2018_test@auc, 3),"\n no background reductions \nor bias\ntest points = 1/5"), position=c("left", "top"))
+
+tmap_save(filename = paste0(results_wd, "/Predictions_maxent_nobg_nobias_2018.png"))
+```
+
+
+
+#########################################################
+## Unstructured data - Nachtigall project MaxEnt model ##
+#########################################################
+
+```{r load unstructured Nachtigall data}
+# species records
+nightingales_2018 <- read.csv(paste0(procdata_wd, "/Nightingales_corrected_2018_maxent.csv"))
+nightingales_2018map <- st_as_sf(nightingales_2018, coords = c("X", "Y"), crs = 25833)
+
+# background environment
+tree_bg <- raster(paste0(procdata_wd, "/Background1000m/tree_100m.asc"), crs = CRS('+init=EPSG:25833'))
+ogreen_bg <-raster(paste0(procdata_wd, "/Background1000m/ogreen_100m.asc"), crs = CRS('+init=EPSG:25833'))
+noise_bg <- raster(paste0(procdata_wd, "/Background1000m/noise_100m.asc"), crs = CRS('+init=EPSG:25833'))
+hpop_bg <- raster(paste0(procdata_wd, "/Background1000m/hpop_100m.asc"), crs = CRS('+init=EPSG:25833'))
+preyabu_bg <- raster(paste0(procdata_wd, "/Background1000m/preyabu_100m.asc"), crs = CRS('+init=EPSG:25833'))
+env_cov_bg <- stack(tree_bg, ogreen_bg, noise_bg, hpop_bg, preyabu_bg)
+names(env_cov_bg) <- c("tree_100m", "ogreen_100m", "noise_100m", "hpop_100m", "preyabu_100m")
+
+# berlin environment
+tree_100m <- raster(paste0(procdata_wd, "/ForPrediction/tree_100m.asc"), crs = CRS('+init=EPSG:25833'))
+ogreen_100m <- raster(paste0(procdata_wd, "/ForPrediction/ogreen_100m.asc"), crs = CRS('+init=EPSG:25833'))
+noise_100m <- raster(paste0(procdata_wd, "/ForPrediction/noise_100m.asc"), crs = CRS('+init=EPSG:25833'))
+hpop_100m <- raster(paste0(procdata_wd, "/ForPrediction/hpop_100m.asc"), crs = CRS('+init=EPSG:25833'))
+preyabu <- raster(paste0(procdata_wd, "/ForPrediction/preyabu_100m.asc"), crs = CRS('+init=EPSG:25833'))
+env_cov <- stack(tree_100m, ogreen_100m, noise_100m, hpop_100m, preyabu)
+names(env_cov) <- c("tree_100m", "ogreen_100m", "noise_100m", "hpop_100m", "preyabu_100m")
+env_cov <- mask(env_cov, berlin)
+
+plot(env_cov)
+plot(env_cov_bg)
+
+# background points
+bg_points <- read.csv(paste0(procdata_wd, "/Background1000m/background_points_bias_1000m_25833.csv"))
+
+# inspect result by plotting
+plot(env_cov_bg$tree_100m, legend=FALSE)
+plot(st_geometry(nightingales_2018map), add = TRUE, cex=0.3)
+points(bg_points, cex=0.3, col = "red")
+
+# divide background into test and training sets 
+set.seed(102)
+group1 <- kfold(bg_points, 5)
+backg1_train <- bg_points[group1 != 1, ]
+backg1_test <- bg_points[group1 == 1, ]
+
+# divide observations into test and training sets
+set.seed(102)
+group <- kfold(nightingales_2018map, 5)
+pres_train <- as.data.frame(st_coordinates(nightingales_2018map[group != 1, ]))
+pres_test <- as.data.frame(st_coordinates(nightingales_2018map[group == 1, ]))
+
+```
+
+```{r run unstructured Nachtigall maxent model}
+# specifying background and presence points for training the model
+# Model with only linear to approximate glm models 
+
+maxent_bias1 <- maxent(x = env_cov_bg, p = pres_train, a = backg1_train,
+                  removeDuplicates = TRUE, path = results_wd, args = c("-P", "-J", "-q", "-t", "-h")) #P: remove variable effects, J: remove jacknife, q: quadratic features in the formula, h: hinge features in the formula
+maxent_bias1
+
+# evaluate model - training points
+eval.maxentbias <- evaluate(maxent_bias1, p=pres_train, a=backg1_train, x=env_cov_bg)
+eval.maxentbias
+
+# evaluate model - test points
+eval.maxentbias1 <- evaluate(maxent_bias1, p=pres_test, a=backg1_test, x=env_cov_bg)
+eval.maxentbias1
+
+plot(eval.maxentbias1, 'ROC')
+
+# Covariate effects and importance
+plot(maxent_bias1)
+
+# effect on responses
+png(paste0(results_wd, "/Covariate_responses.png"))
+response(maxent_bias1)
+dev.off()
+
+png(paste0(results_wd, "/Covariate_importance.png"))
+plot(maxent_bias1)
+dev.off()
+
+var_imp <- plot(maxent_bias1)
+write.csv(as.data.frame(var_imp), paste0(results_wd, "/Covariate_importance.csv"))
+```
+
+```{r predict model in background area}
+# predict model
+px.maxentbias1 <- predict(env_cov_bg, maxent_bias1, progress='')
+
+# Obtain threshold for presence/absence
+tr <- threshold(eval.maxentbias1, 'spec_sens')
+
+
+png(paste0(results_wd, "/Prediction_background.png"), 
+    width = 3000, height = 2000, pointsize = 30)
+par(mfrow=c(1,2))
+
+plot(px.maxentbias1, main='Maxent, raw values')
+plot(st_geometry(berlin), add=TRUE, border='dark grey')
+
+plot(px.maxentbias1 > tr, main='presence/absence')
+plot(st_geometry(berlin), add=TRUE, border='dark grey')
+points(pres_train, pch='+')
+
+dev.off()
+
+par(mfrow=c(1,1))
+
+tmap_mode("plot")
+tm_shape(px.maxentbias1) +
+  tm_raster(palette = "viridis", 
+            title = "Maxent, raw values")
+
+```
+
+```{r predict unstructured Nachtigall maxent model in Berlin}
+# predict model
+pberlin.maxentbias1 <- predict(env_cov, maxent_bias1, progress='')
+
+# Obtain threshold for presence/absence
+tr <- threshold(eval.maxentbias1, 'spec_sens')
+
+png(paste0(results_wd, "/Prediction_berlin.png"), 
+    width = 3000, height = 2000, pointsize = 30)
+par(mfrow=c(1,2))
+
+plot(pberlin.maxentbias1, main='Maxent, raw values')
+plot(st_geometry(berlin), add=TRUE, border='dark grey')
+
+plot(pberlin.maxentbias1 > tr, main='presence/absence')
+plot(st_geometry(berlin), add=TRUE, border='dark grey')
+points(pres_train, pch='+')
+
+dev.off()
+
+par(mfrow=c(1,1))
+
+writeRaster(pberlin.maxentbias1, paste0(results_wd, "/Maxent_berlin_raster_100m_25833.tif"))
+```
+
+```{r plot map predictions unstructured Nachtigall maxent}
+tmap_mode("plot")
+tm_shape(pberlin.maxentbias1) +
+  tm_raster(palette = rev(viridis(10)), 
+            title = "Maxent, raw values")+
+  tm_shape(water) +
+  tm_polygons("lightblue", border.col = NULL)+
+   tm_layout(main.title = "Maxent prediction Nightingales 2018\nselected covariates, with bias", 
+            compass.type = "arrow",
+            legend.title.size = 0.8,
+            legend.text.size = 0.6, 
+          legend.bg.color = "white",
+          legend.position = c("right", "top"),
+            inner.margins = c(0.05,0.05,0.05,0.1),
+          legend.frame = TRUE)+
+  tm_compass(position = c("left", "bottom"),
+             size = 1.5) +
+  tm_scale_bar(position=c("left", "bottom"), 
+               size = 0.6) +
+  tm_credits(paste0("AUC (test)= ", round(eval.maxentbias1@auc, 3),"\nBG buffer: 1000m \nBG points: 10000 \ntest points = 1/5"), position=c("left", "top"))
+
+tmap_save(filename = paste0(results_wd, "/Predictions_maxentbias1_2018.png"))
+```
+
+
+
+#########################
+# COMPARING PREDICTIONS #
+#########################
+
+```{r load nightingale data}
+# Nachtigall project records
+nightingales_2018 <- read.csv(paste0(procdata_wd, "/Nachtigall_project/Nightingales_corrected_2018_maxent.csv")) %>%
+  st_as_sf(coords = c("X", "Y"), crs = 25833)
+
+# eBird records
+eBird_presences_2018 <- read.csv(paste0(procdata_wd, "/eBird/ebd_marjul_201718_nightingale_all_presences.csv")) %>%
+  mutate(year = year(observation_date)) %>%
+  filter(year == 2018) %>%
+  st_as_sf(coords = c("longitude", "latitude"), crs = 4326) %>%
+  st_transform(crs = 25833)
+
+# Standardized data records
+nightingales_transects <- read.csv(paste0(rawdata_wd, "/BreedingBirdMonitoringData_2017/Nightingales2017_BreedingBirdSurvey.csv"))
+transects <- read.csv(paste0(rawdata_wd, "/BreedingBirdMonitoringData_2017/Breeding_transects_variables.csv"))
+
+nightingales_transects2 <- cbind.data.frame(nightingales_transects, transects)
+nightingales_transects_map <- nightingales_transects2 %>%
+  dplyr::select(transect, Lm_counts, Lm_km, X, Y) %>%
+  mutate(Lm_presence = ifelse(Lm_counts>0, 1, 0)) %>%
+  st_as_sf(coords = c("X", "Y"), crs = 25833)
+nightingales_transects_map
+
+nightingales_quadrants <- read_sf(paste0(rawdata_wd, "/EnvCov/birds_quadrants1x1km_3035.gpkg"))
+plot(st_geometry(nightingales_quadrants))
+```
+
+```{r load raster predictions}
+# Jsdm abundance maps
+jsdm_raster <- raster("7_Results/Nightingales_JSDM2017_predictions_100m_25833.tif")
+# transform jsdm raster into probabilities to compare with the other maps
+jsdm_prob_raster <- jsdm_raster/cellStats(jsdm_raster, max)
+
+# Binomial model - Breeding birds 
+binomial_bb_raster <- raster("7_Results/final_results/breeding_birds_models/raster_binomial_prediction_100m_25833.tif")
+
+# Binomial model - eBird 
+binomial_ebird_raster <- raster("7_Results/final_results/ebird_models/raster_binomial_prediction_2018_100m_25833.tif")
+
+# Maxent model - eBird 
+maxent_ebird_raster <- raster("7_Results/final_results/ebird_models/Maxent_ebird_2018_raster_100m_25833.tif")
+
+# Maxent model - Nachtigall 2018
+maxent_nachtigall_raster <- raster( "7_Results/final_results/nachtigall_models/Maxent_berlin_raster_100m_25833.tif")
+```
+
+
+```{r load env variables}
+# berlin context
+berlin <- read_sf(paste0(rawdata_wd, "/EnvCov/berlin_city_border_25833.gpkg"), crs = 25833) %>%
+  st_union()
+water <- read_sf(paste0(rawdata_wd, "/EnvCov/waterbodies_Berlin_25833.gpkg"))
+tree_raster <- raster(paste0(procdata_wd, "/ForPrediction/tree_100m.asc"))
+crs(tree_raster) <- CRS("+init=epsg:25833")
+land_use <- read_sf(paste0(procdata_wd, "/berlin_LandUse_modified_32633.gpkg"),
+                    crs = 32633) %>% st_transform(crs = 25833)
+
+# background polygons
+background.pol <- read_sf(paste0(procdata_wd, "/Background1000m/background_polygon_1000m_25833.gpkg"), crs = 25833) %>%
+  st_sf(st_union(background.pol))
+
+# berlin environmental covariates
+env_cov <- stack(paste0(procdata_wd, "/ForPrediction/env_cov_berlin_100m_25833.tif")) 
+namefile2 <- read.csv(paste0(procdata_wd, "/ForPrediction/names_env_cov_berlin_100m_25833.csv"))
+names(env_cov) <- namefile2$x
+
+# background environmental covariates
+env_cov_bg <- stack(paste0(procdata_wd, "/Background1000m/env_cov_berlin1000m_100m_25833.tif")) 
+namefile <- read.csv(paste0(procdata_wd, "/Background1000m/names_env_cov_berlin1000m_100m_25833.csv"))
+names(env_cov_bg) <- namefile$x
+```
+
+
+
+#~~~~~~~~~~~~~~~#
+# Plot SDM maps #
+#~~~~~~~~~~~~~~~#
+
+
+```{r abundances JSDM prediction}
+tmap_mode("plot")
+
+# With observations in transects
+
+tm_shape(jsdm_raster) +
+  tm_raster(palette = rev(viridis(10)), 
+            title = "JSDM predicted \nabundance",
+            breaks = c(0,2,4,6), 
+            style = "cont")+
+  tm_shape(water) +
+  tm_polygons("lightblue", border.col = NULL)+
+  tm_shape(berlin) +
+  tm_borders("ivory4", lwd = 2) +
+  tm_shape(nightingales_transects_map) +
+  tm_symbols(size = 1, col = "Lm_km", border.col = "black", border.lwd = 2, 
+             palette = rev(viridis(10)), 
+             legend.col.show = FALSE)+
+  tm_add_legend(type = "symbol", labels = "monitoring transects", shape = 21, 
+                size = 1, border.lwd = 2, border.col = "black", col = "white")+
+   tm_layout(main.title = "JSDM Nightingales 2017\n abundances", 
+            compass.type = "arrow",
+            legend.title.size = 1,
+            legend.text.size = 0.8, 
+          legend.bg.color = "white",
+          legend.position = c("right", "top"),
+            inner.margins = c(0.05,0.05,0.05,0.1),
+          legend.frame = TRUE)+
+  tm_compass(position = c("right", "bottom"),
+             size = 3) +
+  tm_scale_bar(position=c("left", "bottom"), 
+               size = 1)
+
+tmap_save(filename = paste0(results_wd, "/JSDM_abundances_transects_map.png"), 
+          width = 8, height = 7, units = "in")
+```
+
+```{r probabilities JSDM prediction}
+# With observations in transects
+
+tm_shape(jsdm_prob_raster) +
+  tm_raster(palette = rev(viridis(10)), 
+            title = "JSDM estimated \nprobabilities",
+            breaks = c(0,0.2,0.4, 0.6, 0.8, 1))+
+  tm_shape(water) +
+  tm_polygons("lightblue", border.col = NULL)+
+  tm_shape(berlin) +
+  tm_borders("ivory4", lwd = 2) +
+  tm_shape(nightingales_transects_map) +
+  tm_symbols(size = 1, col = "Lm_km", border.col = "black", border.lwd = 2,
+             style = "cont", palette = rev(viridis(10)),
+             title.col = "",
+             legend.col.show = TRUE)+
+  tm_layout(main.title = "JSDM Nightingales 2017\nprobabilities based on abundance", 
+            compass.type = "arrow",
+            legend.title.size = 1,
+            legend.text.size = 0.8, 
+            legend.bg.color = "white",
+            legend.position = c("right", "top"),
+            inner.margins = c(0.05,0.05,0.05,0.1),
+            legend.frame = TRUE)+
+  tm_compass(position = c("right", "bottom"),
+             size = 1.2) +
+  tm_scale_bar(position=c("left", "bottom"), 
+               size = 0.5) 
+  
+tmap_save(filename = paste0(results_wd, "/JSDM_probabilites_map.png"), 
+          width = 4.33, height = 3.86, units = "in")
+```
+
+```{r plot binomial standardized monitoring predictions}
+# With observations in transects
+tm_shape(binomial_bb_raster) +
+  tm_raster(palette = rev(viridis(10)), 
+            title = "Binomial GLM \nprobabilities",
+            breaks = c(0,0.2,0.4, 0.6, 0.8, 1))+
+  tm_shape(water) +
+  tm_polygons("lightblue", border.col = NULL)+
+  tm_shape(berlin) +
+  tm_borders("ivory4", lwd = 2) +
+  tm_add_legend(type = "symbol", labels = "Observed abundance", shape = 21, 
+                size = 1, border.lwd = 2, border.col = "black", col = "white")+
+  tm_shape(nightingales_transects_map) +
+  tm_symbols(size = 1, col = "Lm_km", border.col = "black", border.lwd = 2,
+             style = "cont", palette = rev(viridis(10)),
+             title.col = "",
+             legend.col.show = TRUE)+
+  tm_layout(main.title = "Nightingales 2018\nMaxent probabilities selected covariates", 
+            compass.type = "arrow",
+            legend.title.size = 0.8,
+            legend.text.size = 0.6, 
+            legend.bg.color = "white",
+            legend.position = c("right", "top"),
+            inner.margins = c(0.05,0.05,0.05,0.1),
+            legend.frame = TRUE)+
+  tm_compass(position = c("right", "bottom"),
+             size = 3) +
+  tm_scale_bar(position=c("left", "bottom"), 
+               size = 1) 
+
+tmap_save(filename = paste0(results_wd, "/Binomial_GLM_breeding_birds_2017_transects_map.png"), 
+          width = 8, height = 7, units = "in")
+```
+
+```{r plot binomial semi-structured ebird GLM predictions}
+# With observations in transects
+
+tm_shape(binomial_ebird_raster) +
+  tm_raster(palette = rev(viridis(10)), 
+            title = "Binomial GLM \nprobabilities",
+            breaks = c(0,0.2,0.4, 0.6, 0.8, 1))+
+  tm_shape(water) +
+  tm_polygons("lightblue", border.col = NULL)+
+  tm_shape(berlin) +
+  tm_borders("ivory4", lwd = 2) +
+  tm_add_legend(type = "symbol", labels = "Observed abundance", shape = 21, 
+                size = 1, border.lwd = 2, border.col = "black", col = "white")+
+  tm_shape(nightingales_transects_map) +
+  tm_symbols(size = 1, col = "Lm_km", border.col = "black", border.lwd = 2,
+             style = "cont", palette = rev(viridis(10)),
+             title.col = "",
+             legend.col.show = TRUE)+
+  tm_layout(main.title = "Nightingales 2018\nMaxent probabilities selected covariates", 
+            compass.type = "arrow",
+            legend.title.size = 0.8,
+            legend.text.size = 0.6, 
+            legend.bg.color = "white",
+            legend.position = c("right", "top"),
+            inner.margins = c(0.05,0.05,0.05,0.1),
+            legend.frame = TRUE)+
+  tm_compass(position = c("right", "bottom"),
+             size = 3) +
+  tm_scale_bar(position=c("left", "bottom"), 
+               size = 1) 
+
+tmap_save(filename = paste0(results_wd, "/Binomial_GLM_eBird_2018_map.png"), 
+          width = 8, height = 7, units = "in")
+```
+
+
+```{r plot semi-structured ebird maxent predictions}
+# With observations in transects
+tm_shape(maxent_ebird_raster) +
+  tm_raster(palette = rev(viridis(10)), 
+            title = "Maxent model \nprobabilities",
+            breaks = c(0,0.2,0.4, 0.6, 0.8, 1))+
+  tm_shape(water) +
+  tm_polygons("lightblue", border.col = NULL)+
+  tm_shape(berlin) +
+  tm_borders("ivory4", lwd = 2) +
+  tm_shape(nightingales_transects_map) +
+  tm_symbols(size = 1, col = "Lm_km", border.col = "black", border.lwd = 2,
+             style = "cont", palette = rev(viridis(10)),
+             title.col = "",
+             legend.col.show = TRUE)+
+  tm_layout(main.title = "Nightingales 2018\nMaxent probabilities selected covariates", 
+            compass.type = "arrow",
+            legend.title.size = 0.8,
+            legend.text.size = 0.6, 
+            legend.bg.color = "white",
+            legend.position = c("right", "top"),
+            inner.margins = c(0.05,0.05,0.05,0.1),
+            legend.frame = TRUE)+
+  tm_compass(position = c("right", "bottom"),
+             size = 1.2) +
+  tm_scale_bar(position=c("left", "bottom"), 
+               size = 0.5) 
+
+tmap_save(filename = paste0(results_wd, "/Maxent_eBird_2018_selcov_map.png"), 
+          width = 4.33, height = 3.86, units = "in")
+
+```
+
+
+```{r plot unstructured Nachtigall maxent predictions}
+# With observations in transects
+tm_shape(maxent_nachtigall_raster) +
+  tm_raster(palette = rev(viridis(10)), 
+            title = "Maxent model \nprobabilities",
+            breaks = c(0,0.2,0.4, 0.6, 0.8, 1))+
+  tm_shape(water) +
+  tm_polygons("lightblue", border.col = NULL)+
+  tm_shape(berlin) +
+  tm_borders("ivory4", lwd = 2) +
+  tm_shape(nightingales_transects_map) +
+  tm_symbols(size = 1, col = "Lm_km", border.col = "black", border.lwd = 2,
+             style = "cont", palette = rev(viridis(10)),
+             title.col = "",
+             legend.col.show = TRUE)+
+  tm_layout(main.title = "Nightingales 2018\nMaxent probabilities selected covariates", 
+            compass.type = "arrow",
+            legend.title.size = 0.8,
+            legend.text.size = 0.6, 
+            legend.bg.color = "white",
+            legend.position = c("right", "top"),
+            inner.margins = c(0.05,0.05,0.05,0.1),
+            legend.frame = TRUE)+
+  tm_compass(position = c("right", "bottom"),
+             size = 1.2) +
+  tm_scale_bar(position=c("left", "bottom"), 
+               size = 0.5) 
+  
+tmap_save(filename = paste0(results_wd, "/Maxent_Nachtigall_2018_selcov_map.png"), 
+          width = 4.33, height = 3.86, units = "in")
+```
+
+
+#~~~~~~~~~~~~~~~~~~#
+# Sustracting maps #
+#~~~~~~~~~~~~~~~~~~#
+
+Lets compare binomial and maxent maps with the JSDM by sustracting both probabilistic maps
+
+Using Jsdm as a reference, 
+- values of **zero** will show areas with the **same prediction**,
+- **positive** values will show areas where probability is **lower in maxent model**
+- **negative** values will show areas where probability is **higher in maxent model**.
+
+## Standardized monitoring binomial glm 
+```{r}
+jsdm_binomial_breedingbirds_raster <- jsdm_prob_raster - binomial_bb_raster
+
+tm_shape(jsdm_binomial_breedingbirds_raster) +
+  tm_raster(palette = "PuOr", 
+            title = "Difference \nJSDM - Binomial GLM\nBreeding birds",
+            breaks = c(-1,-0.5,0, 0.5, 1),
+            style = "cont")+
+  tm_shape(water) +
+  tm_polygons("lightblue", border.col = NULL)+
+  tm_shape(berlin) +
+  tm_borders("ivory4", lwd = 2) +
+   tm_layout(main.title = "Jsdm - binomial GLM - Breeding birds", 
+            compass.type = "arrow",
+            legend.title.size = 0.8,
+            legend.text.size = 0.6, 
+          legend.bg.color = "white",
+          legend.position = c("right", "top"),
+            inner.margins = c(0.05,0.05,0.05,0.1),
+          legend.frame = TRUE)+
+  tm_compass(position = c("right", "bottom"),
+             size = 3) +
+  tm_scale_bar(position=c("left", "bottom"), 
+               size = 1) 
+
+tmap_save(filename = paste0(results_wd, "/Comparison_JSDM-BinomialGLM_breedingbirds_2017_map.png"), 
+          width = 8, height = 7, units = "in")
+```
+
+## semi-structured ebird binomial glm 
+```{r}
+jsdm_binomial_ebird_raster <- jsdm_prob_raster - binomial_ebird_raster
+
+tm_shape(jsdm_binomial_ebird_raster) +
+  tm_raster(palette = "PuOr", 
+            title = "Difference \nJSDM - Binomial GLM\neBird data",
+            breaks = c(-1,-0.5,0, 0.5, 1),
+            style = "cont")+
+  tm_shape(water) +
+  tm_polygons("lightblue", border.col = NULL)+
+  tm_shape(berlin) +
+  tm_borders("ivory4", lwd = 2) +
+   tm_layout(main.title = "Jsdm - binomial GLM - eBird", 
+            compass.type = "arrow",
+            legend.title.size = 0.8,
+            legend.text.size = 0.6, 
+          legend.bg.color = "white",
+          legend.position = c("right", "top"),
+            inner.margins = c(0.05,0.05,0.05,0.1),
+          legend.frame = TRUE)+
+  tm_compass(position = c("right", "bottom"),
+             size = 3) +
+  tm_scale_bar(position=c("left", "bottom"), 
+               size = 1) 
+
+tmap_save(filename = paste0(results_wd, "/Comparison_JSDM-BinomialGLM_ebird_2018_map.png"), 
+          width = 8, height = 7, units = "in")
+```
+
+
+## Semi-structured Maxent ebird
+```{r}
+jsdm_maxent_ebird_raster <- jsdm_prob_raster - maxent_ebird_raster
+
+tm_shape(jsdm_maxent_ebird_raster) +
+  tm_raster(palette = "PuOr", 
+            title = "Difference \nJSDM - Maxent \neBird data",
+            breaks = c(-1,-0.5,0, 0.5, 1),
+            style = "cont")+
+  tm_shape(water) +
+  tm_polygons("lightblue", border.col = NULL)+
+  tm_shape(berlin) +
+  tm_borders("ivory4", lwd = 2) +
+   tm_layout(main.title = "Jsdm - Maxent model \nselected covariates", 
+            compass.type = "arrow",
+            legend.title.size = 0.8,
+            legend.text.size = 0.6, 
+          legend.bg.color = "white",
+          legend.position = c("right", "top"),
+            inner.margins = c(0.05,0.05,0.05,0.1),
+          legend.frame = TRUE)+
+  tm_compass(position = c("right", "bottom"),
+             size = 3) +
+  tm_scale_bar(position=c("left", "bottom"), 
+               size = 1) 
+
+tmap_save(filename = paste0(results_wd, "/Comparison_JSDM-Maxent_ebird_map.png"), 
+         width = 8, height = 7, units = "in")
+```
+
+## Unstructured Maxent nachtigall
+```{r}
+jsdm_maxent_nachtigall_raster <- jsdm_prob_raster - maxent_nachtigall_raster
+
+tm_shape(jsdm_maxent_nachtigall_raster) +
+  tm_raster(palette = "PuOr", 
+            title = "Difference \nJSDM - Maxent \nNachtigall project",
+            breaks = c(-1,-0.5,0, 0.5, 1),
+            style = "cont")+
+  tm_shape(water) +
+  tm_polygons("lightblue", border.col = NULL)+
+  tm_shape(berlin) +
+  tm_borders("ivory4", lwd = 2) +
+   tm_layout(main.title = "Jsdm - Maxent model - Nachtigall project 2018", 
+            compass.type = "arrow",
+            legend.title.size = 0.8,
+            legend.text.size = 0.6, 
+          legend.bg.color = "white",
+          legend.position = c("right", "top"),
+            inner.margins = c(0.05,0.05,0.05,0.1),
+          legend.frame = TRUE)+
+  tm_compass(position = c("right", "bottom"),
+             size = 3) +
+  tm_scale_bar(position=c("left", "bottom"), 
+               size = 1) 
+
+tmap_save(filename = paste0(results_wd, "/Comparison_JSDM-Maxent_nachtigall_map.png"), 
+         width = 8, height = 7, units = "in")
+```
+
+
+
+
