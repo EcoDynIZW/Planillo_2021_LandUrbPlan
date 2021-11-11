@@ -1,6 +1,19 @@
-Code used for 
-Planillo, A., Fiechter, L., Sturm, U., Voigt-Heucke, S., & Kramer-Schadt, S. (2021). Citizen science data for urban planning: Comparing different sampling schemes for modelling urban bird distribution. Landscape and Urban Planning, 211(September 2020), 104098. https://doi.org/10.1016/j.landurbplan.2021.104098
+# Planillo et al. 2021 *Landscape and Urban Planning*
 
+> **Aimara Planillo**, Lena Fiechter, Ulrike Sturm, Silke Voigt-Heucke & **Stephanie Kramer-Schadt** (2021),
+Citizen science data for urban planning: Comparing different sampling schemes for modelling urban bird distribution. *Landscape and Urban Planning* 211(September 2020), 104098, DOI: [j.landurbplan.2021.104098](https://doi.org/10.1016/j.landurbplan.2021.104098)
+
+#### Study Highlights:
+
+* CS standardized data outperform opportunistic data for SDMs.
+* Opportunistic data fail to identify key areas for nightingale distribution.
+* Citizen Science projects aimed at SDM should be designed to avoid data bias.
+* Environmental gradients should be considered in CS project designs.
+* Recording species absences could improve opportunistic data quality.
+
+---
+
+### Scripts
 
 There are three scripts and a source file with the R packages required to run the code.
 The scripts load and save data to specific folders that were not included in github due to size limitations.
