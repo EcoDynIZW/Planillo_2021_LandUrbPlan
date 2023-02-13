@@ -1,4 +1,4 @@
-# Planillo et al. 2021 *Landscape and Urban Planning*
+# Planillo et al. (2021) *Landscape and Urban Planning*
 
 > **Aimara Planillo**, Lena Fiechter, Ulrike Sturm, Silke Voigt-Heucke & **Stephanie Kramer-Schadt** (2021),
 Citizen science data for urban planning: Comparing different sampling schemes for modelling urban bird distribution. *Landscape and Urban Planning* 211(September 2020), 104098, DOI: [j.landurbplan.2021.104098](https://doi.org/10.1016/j.landurbplan.2021.104098)
